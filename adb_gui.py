@@ -43,6 +43,28 @@ import queue as _queue
 import whatsapp_batch as wb
 import contacts_extract as ce
 
+
+def _load_contacts_map(contacts_dir):
+    """number(digits) -> display name, from the contacts CSVs extract_contacts wrote. Used to put
+    saved contact names on reconstructed chats."""
+    import csv as _csv
+    import re as _re
+    out = {}
+    for fn in ("whatsapp_contacts.csv", "contacts.csv"):
+        p = os.path.join(contacts_dir, fn)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for row in _csv.DictReader(f):
+                    num = _re.sub(r"\D", "", row.get("number") or row.get("normalized_number") or "")
+                    name = (row.get("name") or "").strip()
+                    if num and name and num not in out:
+                        out[num] = name
+        except Exception:
+            pass
+    return out
+
 BASE = Path(__file__).resolve().parent
 MACRO_DIR = BASE / "macros"
 CASE_DIR = BASE / "cases"
@@ -781,6 +803,8 @@ class App:
         ttk.Button(top, text="Connect", command=self.connect).pack(side="left", padx=4)
         ttk.Button(top, text="Contacts + WhatsApp JIDs → folder...",
                    command=self.extract_contacts_to_folder).pack(side="left", padx=4)
+        ttk.Button(top, text="Reconstruct from backup (read-only)...",
+                   command=self.reconstruct_backup).pack(side="left", padx=4)
         self.info_lbl = ttk.Label(top, text="not connected")
         self.info_lbl.pack(side="left", padx=10)
         self.live_var = tk.BooleanVar(value=True)
@@ -954,6 +978,84 @@ class App:
                              f"{res['whatsapp']} WhatsApp contacts -> {names or '(no files)'}")
             except Exception as e:
                 self._adblog(f"contacts: extraction error: {e!r}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def reconstruct_backup(self):
+        """Read-only full extraction: pull/decrypt WhatsApp's own backup and rebuild every chat as a
+        WhatsApp-export .zip on the PC. Never writes to the phone. Works from the live phone, or from
+        a .crypt15 (+ key) / already-decrypted msgstore.db you already have."""
+        import wa_backup as wab
+        key = None
+        if self.adb and messagebox.askyesno(
+                "Pull from phone?",
+                "Pull WhatsApp's backup from the connected phone now?\n\n"
+                "This is READ-ONLY - it only copies the backup off the phone and writes nothing to "
+                "it.\n\nChoose 'No' to instead pick a .crypt15 or already-decrypted msgstore.db you "
+                "already have."):
+            src = "device"
+        else:
+            src = filedialog.askopenfilename(
+                title="Pick a WhatsApp backup (.crypt15) or a decrypted msgstore.db",
+                filetypes=[("WhatsApp backup / db", "*.crypt15 *.crypt14 *.db"), ("All files", "*.*")])
+            if not src:
+                return
+            if src.endswith((".crypt15", ".crypt14", ".crypt12")):
+                key = filedialog.askopenfilename(
+                    title="Pick the 64-character backup key file (e.g. Wakey.txt)",
+                    filetypes=[("Key file", "*.txt *.key"), ("All files", "*.*")])
+                if not key:
+                    messagebox.showinfo("Key needed", "A .crypt15 backup needs its backup key.")
+                    return
+        include_media = messagebox.askyesno(
+            "Include media?", "Include media (photos, videos, documents) in the reconstructed "
+            "chats?\n\nYes = self-contained evidence but larger and slower.\nNo = text only (fast).")
+        out = filedialog.askdirectory(title="Choose an output folder for the reconstructed chats")
+        if not out:
+            return
+
+        adb = self.adb
+        media_pick = None
+        if include_media and src != "device":
+            media_pick = filedialog.askdirectory(
+                title="Pick the WhatsApp 'Media' folder (or its parent) - Cancel to skip media") or None
+
+        def work():
+            try:
+                db_path = None
+                media_root = media_pick
+                contacts = None
+                if src == "device":
+                    try:
+                        cdir = os.path.join(out, "_contacts")
+                        ce.extract_contacts(adb, cdir, log=self._adblog)
+                        contacts = _load_contacts_map(cdir)
+                    except Exception as e:
+                        self._adblog(f"backup: contacts step skipped ({e!r})")
+                    crypt, _dg = wab.pull_backup(adb, out, emit=self._adblog)
+                    if not crypt:
+                        return
+                    if include_media:
+                        media_root = wab.pull_media(adb, out, emit=self._adblog)
+                    db_path = os.path.join(out, "msgstore.db")
+                    self._adblog("backup: pick the 64-char backup key file for THIS device...")
+                    kpick = filedialog.askopenfilename(title="Backup key file (e.g. Wakey.txt)")
+                    if not kpick or not wab.decrypt_backup(crypt, kpick, db_path, emit=self._adblog):
+                        return
+                elif src.endswith((".crypt15", ".crypt14", ".crypt12")):
+                    db_path = os.path.join(out, "msgstore.db")
+                    if not wab.decrypt_backup(src, key, db_path, emit=self._adblog):
+                        return
+                else:
+                    db_path = src                       # already a decrypted msgstore.db
+
+                self._adblog("backup: reconstructing chats (read-only)...")
+                mans = wab.reconstruct(db_path, media_root, out, contacts=contacts,
+                                       copy_media=include_media, emit=self._adblog)
+                self._adblog(f"backup: DONE - {len(mans)} chats reconstructed into {out}")
+                self._adblog('backup: view with  python chat_viewer.py "%s"' % out)
+            except Exception as e:
+                self._adblog(f"backup: error: {e!r}")
 
         threading.Thread(target=work, daemon=True).start()
 

@@ -198,12 +198,34 @@ reading the screen (no coordinates; works for chats and groups), trying with med
 falling back to without-media if the export popup appears. To use one, copy it into `macros/`
 and **Load** it in the app. See [presets/README.md](presets/README.md) for details.
 
-## 7. Batch export WhatsApp chats to the PC (Quick Share)
+## 7. Collecting WhatsApp chats
 
-For bulk logical extraction, the app can walk **every** WhatsApp chat and save each export
-straight to this PC over **Quick Share** — no cloud, no cable copy, and it works fully
-**offline** (Quick Share uses Bluetooth + Wi-Fi Direct, so it runs in airplane mode as long as
-Bluetooth and Wi-Fi are switched on). Every saved file is SHA-256 hashed and logged to a CSV.
+There are two methods. See [docs/RELIABILITY.md](docs/RELIABILITY.md) for how each stays
+evidence-safe.
+
+### 7a. Read-only backup extraction (whole phone, recommended) — [`wa_backup.py`](wa_backup.py)
+
+**Writes nothing to the phone.** It `adb pull`s the files WhatsApp already keeps on shared storage
+(the encrypted `msgstore.db.crypt15` backup and the `Media` folder), decrypts the backup with the
+device's 64-character backup key, and rebuilds **every** chat on the PC as a WhatsApp-export-style
+`.zip` (`_chat.txt` + media) — so the viewer below and the SHA-256/CSV manifest work unchanged. Far
+faster than Quick Share, no duplicates, and it includes chats too large to export with media.
+
+In the app: **Reconstruct from backup (read-only)...** — pull from the connected phone, or point it
+at a `.crypt15` (+ key) or an already-decrypted `msgstore.db`. Or from the command line on a
+decrypted DB:
+```bash
+python wa_backup.py msgstore.db out_dir "path\to\WhatsApp\Media"   # or omit media / --no-media
+```
+Needs [`wa-crypt-tools`](https://pypi.org/project/wa-crypt-tools/) (`pip install wa-crypt-tools`) to
+decrypt, and the device's backup key. Freshness = WhatsApp's last on-phone backup.
+
+### 7b. Batch export per chat to the PC (Quick Share)
+
+The app can also walk **every** WhatsApp chat and save each export straight to this PC over
+**Quick Share** — no cloud, no cable copy, fully **offline** (Bluetooth + Wi-Fi Direct). Every saved
+file is SHA-256 hashed and logged to a CSV. Use this for specific chats, or when a current backup
+isn't available.
 
 ### One-time setup
 1. Install **Quick Share for Windows** on the PC and sign in; set it to **receive** and choose a
