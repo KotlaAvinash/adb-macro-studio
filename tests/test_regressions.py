@@ -407,5 +407,153 @@ class TestContactsAndZips(unittest.TestCase):
         self.assertFalse(bt.zip_media_info(c)["ok"])
 
 
+# ----------------------------------------------------------------------------- read-only backup
+def _msgstore(path, with_media_root=None):
+    """Build a tiny msgstore.db with the real modern schema subset for the reconstructor."""
+    import sqlite3
+    c = sqlite3.connect(path)
+    c.executescript("""
+        CREATE TABLE jid(_id INTEGER PRIMARY KEY, user TEXT, server TEXT, agent INT, device INT,
+                         type INT, raw_string TEXT);
+        CREATE TABLE jid_map(lid_row_id INT, jid_row_id INT, sort_id INT);
+        CREATE TABLE lid_display_name(lid_row_id INT, display_name TEXT, username TEXT);
+        CREATE TABLE chat(_id INTEGER PRIMARY KEY, jid_row_id INT, subject TEXT);
+        CREATE TABLE message(_id INTEGER PRIMARY KEY, chat_row_id INT, from_me INT,
+                             sender_jid_row_id INT, timestamp INT, message_type INT, text_data TEXT);
+        CREATE TABLE message_media(message_row_id INT, chat_row_id INT, file_path TEXT,
+                                   mime_type TEXT, media_caption TEXT);
+    """)
+    # jids: 1 = me-ish contact phone, 2 = Alice (phone), 3 = Alice's LID, 4 = group, 5 = Bob phone
+    c.executemany("INSERT INTO jid VALUES(?,?,?,?,?,?,?)", [
+        (2, "919876543210", "s.whatsapp.net", 0, 0, 0, "919876543210@s.whatsapp.net"),
+        (3, "111222333", "lid", 0, 0, 0, "111222333@lid"),
+        (4, "120363-GRP", "g.us", 0, 0, 0, "120363-GRP@g.us"),
+        (5, "919000000005", "s.whatsapp.net", 0, 0, 0, "919000000005@s.whatsapp.net"),
+    ])
+    c.execute("INSERT INTO jid_map VALUES(3,2,0)")                 # Alice's LID -> her phone row
+    c.execute("INSERT INTO lid_display_name VALUES(3,'Alice LID','alice')")
+    c.executemany("INSERT INTO chat VALUES(?,?,?)", [
+        (10, 3, None),            # 1:1 chat addressed by LID (modern privacy)
+        (11, 4, "Project Team"),  # group
+        (12, 5, None),            # 1:1, system-only -> should produce NO zip
+    ])
+    T = 1_700_000_000_000
+    c.executemany("INSERT INTO message VALUES(?,?,?,?,?,?,?)", [
+        (100, 10, 0, 3, T + 1000, 0, "hi there"),                 # Alice -> me
+        (101, 10, 1, None, T + 2000, 0, "hello back"),            # me -> Alice
+        (102, 10, 0, 3, T + 3000, 1, None),                       # Alice -> me, image
+        (200, 11, 0, 5, T + 5000, 0, "team message"),             # Bob in group
+        (300, 12, 0, 5, T + 9000, 7, None),                       # system only (no text/media)
+    ])
+    c.execute("INSERT INTO message_media VALUES(102,10,'Media/WhatsApp Images/IMG-1.jpg',"
+              "'image/jpeg','a caption')")
+    c.commit(); c.close()
+    if with_media_root:
+        d = os.path.join(with_media_root, "Media", "WhatsApp Images")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "IMG-1.jpg"), "wb") as f:
+            f.write(b"\xff\xd8" + b"J" * 500)
+
+
+class TestBackupReconstruct(unittest.TestCase):
+    def setUp(self):
+        import wa_backup
+        self.wab = wa_backup
+        self.d = tempfile.mkdtemp()
+        self.db = os.path.join(self.d, "msgstore.db")
+
+    def _zip_text(self, out, startswith):
+        import glob
+        z = [p for p in glob.glob(os.path.join(out, "*.zip"))
+             if os.path.basename(p).startswith(startswith)]
+        self.assertTrue(z, f"no zip starting with {startswith!r}")
+        with zipfile.ZipFile(z[0]) as zf:
+            return z[0], zf.read("_chat.txt").decode("utf-8"), zf.namelist()
+
+    def test_reconstructs_only_chats_with_content(self):
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        mans = self.wab.reconstruct(self.db, None, out, copy_media=False, emit=lambda m: None)
+        titles = {m["title"] for m in mans}
+        self.assertIn("Project Team", titles)
+        self.assertNotIn(None, titles)
+        self.assertEqual(len(mans), 2)               # LID 1:1 + group; system-only chat skipped
+
+    def test_lid_chat_resolves_to_phone_number(self):
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        self.wab.reconstruct(self.db, None, out, copy_media=False, emit=lambda m: None)
+        _p, txt, _ = self._zip_text(out, "WhatsApp Chat with Alice LID")
+        self.assertIn("919876543210", os.path.basename(_p))   # LID mapped to the real phone number
+
+    def test_contact_name_used_when_available(self):
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        self.wab.reconstruct(self.db, None, out, contacts={"919876543210": "Alice Kumar"},
+                             owner="Investigator", copy_media=False, emit=lambda m: None)
+        _p, txt, _ = self._zip_text(out, "WhatsApp Chat with Alice Kumar")
+        self.assertIn("Alice Kumar: hi there", txt)
+        self.assertIn("Investigator: hello back", txt)       # from_me uses the owner name
+
+    def test_media_message_becomes_attachment_and_is_copied(self):
+        _msgstore(self.db, with_media_root=self.d)
+        out = os.path.join(self.d, "out")
+        self.wab.reconstruct(self.db, self.d, out, copy_media=True, emit=lambda m: None)
+        _p, txt, names = self._zip_text(out, "WhatsApp Chat with Alice LID")
+        self.assertIn("<attached: IMG-1.jpg>", txt)
+        self.assertIn("a caption", txt)
+        self.assertIn("IMG-1.jpg", names)                    # the real media file is inside the zip
+
+    def test_output_is_viewer_parseable(self):
+        import chat_viewer as cv
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        self.wab.reconstruct(self.db, None, out, copy_media=False, emit=lambda m: None)
+        _p, txt, _ = self._zip_text(out, "WhatsApp Chat with Alice LID")
+        msgs = cv.parse_chat_text(txt)
+        self.assertGreaterEqual(len(msgs), 3)
+
+    def test_only_numbers_filter(self):
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        mans = self.wab.reconstruct(self.db, None, out, only_numbers=["+91 98765 43210"],
+                                    copy_media=False, emit=lambda m: None)
+        self.assertEqual([m["title"] for m in mans], ["Alice LID"])
+
+    def test_reconstruct_never_overwrites_existing_evidence(self):
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        os.makedirs(out)
+        with open(os.path.join(out, "WhatsApp Chat with Project Team.zip"), "w") as f:
+            f.write("PRE-EXISTING")
+        self.wab.reconstruct(self.db, None, out, copy_media=False, emit=lambda m: None)
+        with open(os.path.join(out, "WhatsApp Chat with Project Team.zip")) as f:
+            self.assertEqual(f.read(), "PRE-EXISTING")       # untouched; new one saved as (1)
+        import glob
+        self.assertTrue(glob.glob(os.path.join(out, "*Project Team (1).zip")))
+
+    def test_manifest_has_sha256_per_chat(self):
+        _msgstore(self.db)
+        out = os.path.join(self.d, "out")
+        mans = self.wab.reconstruct(self.db, None, out, copy_media=False, emit=lambda m: None)
+        for m in mans:
+            self.assertEqual(len(m["sha256"]), 64)
+        self.assertTrue(os.path.isfile(os.path.join(out, "backup_chats.csv")))
+
+    def test_newest_backup_uses_one_device_command(self):
+        seen = []
+
+        class A:
+            def shell(self, *args, **k):
+                seen.append(args)
+                if "-d" in args:
+                    return "/sdcard/Android/media/com.whatsapp/WhatsApp"
+                return ("/sdcard/Android/media/com.whatsapp/WhatsApp/Databases/"
+                        "msgstore-2026-10-07.1.db.crypt15\n")
+        got = self.wab.newest_backup(A())
+        self.assertTrue(got.endswith(".crypt15"))
+        self.assertTrue(all(len(s) <= 3 for s in seen))      # ls commands, device handles the glob
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
