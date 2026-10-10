@@ -156,28 +156,19 @@ Warning signs and what they mean:
 
 ---
 
-## 8. USB transfer mode (`adb pull`) — removing the root cause
+## 8. Two collection methods
 
-Most field bugs (false "failed", retries, duplicates, slowness) shared one root cause: **Quick Share
-gives no ground truth.** The PC file is written atomically at the very end (nothing visible
-mid-transfer), the phone's screen lists every nearby device, and over Bluetooth it is slow — so
-"did it arrive?" had to be *inferred from timing*.
+**Quick Share export (per chat)** is the default and is covered above: WhatsApp exports each chat to
+a `.zip`, sent to the PC over Quick Share.
 
-Ticking **"USB transfer (adb pull) instead of Quick Share"** removes that channel: the export is
-saved to the phone's own storage via the share sheet's **Save to Files / My Files / Files** target,
-and the tool `adb pull`s the **exact** file over USB into the Save folder.
-
-- Deterministic: the tool knows precisely which file it saved — no guessing, no nearby devices.
-- Fast: USB is far quicker than Bluetooth.
-- No duplicates: before any retry it checks whether an earlier attempt already saved the export on
-  the phone, and pulls that instead of exporting again. A pulled file never overwrites an existing
-  one (`name (1).zip`, ...).
-- First run only: if the save target isn't readable on your phone, the log says
-  **ACTION NEEDED: tap your 'Save to Files' / 'My Files' share target** — tap it once on the phone;
-  your tap does the action *and* teaches the position for every following chat (same for the
-  Save/Done confirmation, if your file manager shows one).
-
-Note: in this mode a copy of each export also stays in the phone's Download/Documents folder.
+**Read-only backup extraction (whole phone)** is the primary method for a full collection. It never
+writes to the phone: the tool `adb pull`s the files WhatsApp already stores
+(`/sdcard/Android/media/com.whatsapp/WhatsApp/...` — the encrypted `msgstore.db.crypt15` backup and
+the `Media` folder), decrypts the backup with the device's 64-character backup key, and rebuilds
+every chat on the PC (text + media + SHA-256 + a CSV/JSON manifest) for the offline viewer. It is far
+faster than Quick Share, has no duplicates, and includes chats too large for WhatsApp to export with
+media. (An earlier "save on the phone then pull" idea was removed: it would have written a copy of
+every export onto the evidence device — unacceptable for a seized phone.)
 
 ## 9. Screen reading — what makes it robust
 

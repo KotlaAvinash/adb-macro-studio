@@ -257,15 +257,11 @@ class TestQuickShareNoDuplicates(unittest.TestCase):
         with mock.patch.object(wb, "time", clock), mock.patch.object(wb, "_nodes", lambda adb: []):
             self.assertIsNone(wb._await_late_file(None, d, before, lambda m: None, Ev(), 200))
 
-    def _retry(self, send, late=None, reopen=lambda: True, transport="quickshare"):
+    def _retry(self, send, late=None, reopen=lambda: True):
         with mock.patch.object(wb, "export_and_send", send), \
-                mock.patch.object(wb, "export_and_pull", send), \
-                mock.patch.object(wb, "_await_late_file", lambda *a, **k: late), \
-                mock.patch.object(wb, "_phone_zips", lambda adb: {}), \
-                mock.patch.object(wb, "_await_phone_zip", lambda *a, **k: None):
+                mock.patch.object(wb, "_await_late_file", lambda *a, **k: late):
             return wb.export_with_retry(None, Case(), (1080, 2400), reopen, lambda m: None, None,
-                                        None, "PC", tempfile.mkdtemp(), lambda: None,
-                                        transport=transport)
+                                        None, "PC", tempfile.mkdtemp(), lambda: None)
 
     def test_late_file_is_accepted_without_a_second_send(self):
         calls = []
@@ -376,59 +372,6 @@ class TestRunResilience(unittest.TestCase):
             b.run()
         self.assertIn("finished", events)
         self.assertTrue(any("unexpected error (continuing" in m for m in logs))
-
-
-# ----------------------------------------------------------------------------- adb-pull transport
-class TestAdbPullTransport(unittest.TestCase):
-    def test_phone_zip_listing_is_one_device_side_command(self):
-        seen = []
-
-        class A:
-            def shell(self, *args, **k):
-                seen.append(args)
-                return ("1234|/sdcard/Download/WhatsApp Chat with A.zip\n"
-                        "55|/sdcard/Documents/notes.txt\nbad line\n")
-        self.assertEqual(wb._phone_zips(A()), {"/sdcard/Download/WhatsApp Chat with A.zip": 1234})
-        self.assertEqual(len(seen[0]), 1)        # ONE string -> device shell handles quoting/globs
-
-    def test_waits_until_the_saved_file_stops_growing(self):
-        sizes = iter([{"/sdcard/Download/x.zip": 100}, {"/sdcard/Download/x.zip": 200},
-                      {"/sdcard/Download/x.zip": 200}])
-        with mock.patch.object(wb, "time", FakeClock()), \
-                mock.patch.object(wb, "_phone_zips", lambda adb: next(sizes)):
-            self.assertEqual(wb._await_phone_zip(None, {}, timeout=60), ("/sdcard/Download/x.zip", 200))
-
-    def test_pull_never_overwrites_existing_evidence(self):
-        d = tempfile.mkdtemp()
-        existing = os.path.join(d, "WhatsApp Chat with A.zip")
-        with open(existing, "w") as f:
-            f.write("OLD")
-
-        class A:
-            def pull(self, remote, local_dir):
-                mkzip(os.path.join(str(local_dir), remote.rsplit("/", 1)[-1]))
-        got = wb._pull_unique(A(), "/sdcard/Download/WhatsApp Chat with A.zip", d)
-        self.assertTrue(got.endswith("WhatsApp Chat with A (1).zip"))
-        with open(existing) as f:
-            self.assertEqual(f.read(), "OLD")
-
-    def test_retry_pulls_the_already_saved_export_instead_of_exporting_again(self):
-        d = tempfile.mkdtemp()
-        z = os.path.join(d, "ok.zip")
-        mkzip(z)
-        calls = []
-
-        def pull_send(*a, **k):
-            calls.append(1)
-            return "fail-transfer", None, None, "with media"
-        with mock.patch.object(wb, "export_and_pull", pull_send), \
-                mock.patch.object(wb, "_phone_zips", lambda adb: {}), \
-                mock.patch.object(wb, "_await_phone_zip", lambda *a, **k: ("/sdcard/Download/ok.zip", 9)), \
-                mock.patch.object(wb, "_pull_unique", lambda *a, **k: z):
-            st = wb.export_with_retry(None, Case(), (1, 1), lambda: True, lambda m: None, None,
-                                      None, "PC", d, lambda: None, transport="adb")
-        self.assertEqual(st[0], "ok")
-        self.assertEqual(len(calls), 1)
 
 
 # ----------------------------------------------------------------------------- contacts + zips
