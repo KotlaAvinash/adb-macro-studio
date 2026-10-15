@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile every module
-        run: python -m py_compile adb_core.py whatsapp_batch.py bt_transfer.py contacts_extract.py wa_backup.py adb_gui.py
+        run: python -m py_compile adb_core.py whatsapp_batch.py bt_transfer.py contacts_extract.py wa_backup.py chat_viewer.py qs_accept.py adb_cli.py adb_gui.py
       - name: Regression suite (standard library only - no device, no installs)
         env:
           PYTHONIOENCODING: utf-8

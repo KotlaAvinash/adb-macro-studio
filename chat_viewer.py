@@ -114,6 +114,40 @@ def parse_chat_text(text):
     return msgs
 
 
+# Resource limits for UNTRUSTED export zips (media originates on the phone). Prevents a zip bomb or
+# an accidentally huge archive from exhausting memory/disk. Tunable via build()'s policy if needed.
+MAX_ZIP_FILES = 20_000
+MAX_ZIP_MEMBER = 512 * 1024 ** 2        # 512 MB uncompressed per member
+MAX_ZIP_TOTAL = 4 * 1024 ** 3           # 4 GB uncompressed per archive
+MAX_ZIP_RATIO = 200                     # uncompressed/compressed per member
+MAX_CHAT_TXT = 256 * 1024 ** 2          # 256 MB for _chat.txt
+
+
+def _zip_policy_violation(zf):
+    """Return a reason string if the archive violates the resource policy, else None. Reads only the
+    central-directory metadata (infolist) - it does NOT decompress anything."""
+    try:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+    except Exception as e:
+        return f"unreadable archive index ({e})"
+    if len(infos) > MAX_ZIP_FILES:
+        return f"{len(infos)} entries exceeds {MAX_ZIP_FILES}"
+    total = 0
+    for i in infos:
+        if getattr(i, "flag_bits", 0) & 0x1:
+            return "encrypted member"
+        if i.file_size > MAX_ZIP_MEMBER:
+            return f"member {i.filename!r} is {i.file_size} bytes (> {MAX_ZIP_MEMBER})"
+        if i.compress_size and (i.file_size / i.compress_size) > MAX_ZIP_RATIO:
+            return f"member {i.filename!r} expansion ratio > {MAX_ZIP_RATIO}"
+        if i.filename.lower().endswith(".txt") and i.file_size > MAX_CHAT_TXT:
+            return f"text member {i.filename!r} is {i.file_size} bytes (> {MAX_CHAT_TXT})"
+        total += i.file_size
+    if total > MAX_ZIP_TOTAL:
+        return f"uncompressed total {total} bytes (> {MAX_ZIP_TOTAL})"
+    return None
+
+
 def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
     """Return a chat dict {name, messages, ...} from one export zip, or None if it has no chat.
     mode="embed": media as base64 data URIs (single-file output).
@@ -123,6 +157,10 @@ def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
         zf = zipfile.ZipFile(path)
     except Exception as e:
         print(f"  skip {os.path.basename(path)}: {e}")
+        return None
+    bad = _zip_policy_violation(zf)      # reject zip bombs / oversized archives before reading members
+    if bad:
+        print(f"  skip {os.path.basename(path)}: {bad}")
         return None
     names = zf.namelist()
     txt_name = next((n for n in names if n.lower().endswith("_chat.txt")), None) \

@@ -105,9 +105,18 @@ def pull_media(adb, dest_dir, emit=print):
 
 
 # --------------------------------------------------------------------------- decrypt
-def decrypt_backup(crypt_path, key, out_db, emit=print):
+def _rm(path):
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def decrypt_backup(crypt_path, key, out_db, emit=print, decrypt_timeout=1800):
     """Decrypt msgstore.db.crypt1x with wa-crypt-tools. `key` is a 64-hex string or a key file path.
-    Returns out_db on success, else None."""
+    Returns out_db on success, else None. A hung decryptor can't stall the workflow forever
+    (decrypt_timeout, default 30 min); a failed/timed-out run leaves no partial output."""
     try:
         import wa_crypt_tools  # noqa: F401
     except Exception:
@@ -115,11 +124,18 @@ def decrypt_backup(crypt_path, key, out_db, emit=print):
         return None
     cmd = [sys.executable, "-m", "wa_crypt_tools.wadecrypt", key, crypt_path, out_db]
     emit("decrypting backup...")
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=decrypt_timeout)
+    except subprocess.TimeoutExpired:
+        emit(f"decrypt timed out after {decrypt_timeout}s - aborting")
+        _rm(out_db)                                # never leave a partial/ambiguous output
+        return None
     if r.returncode != 0 or not os.path.isfile(out_db):
         tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
         emit("decrypt failed: " + " | ".join(tail))
         emit("  (a wrong key shows 'MAC check failed'; a corrupt/partial backup fails the same way)")
+        _rm(out_db)
         return None
     emit(f"decrypted -> {os.path.basename(out_db)}")
     return out_db
@@ -135,10 +151,13 @@ def _cols(cur, table):
     return {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
 
 
-def _ts_to_ios(ms):
-    """WhatsApp stores epoch milliseconds. Format like an iOS export: [DD/MM/YYYY, HH:MM:SS]."""
+def _ts_utc(ms):
+    """WhatsApp stores epoch milliseconds. Return a UTC datetime (NOT the analyst's local time - the
+    source device timezone is unknown, so converting to the workstation's local zone would silently
+    misstate the record). Reconstructed timestamps are therefore UTC; the manifest also keeps the raw
+    epoch so the original value is never lost."""
     try:
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone()
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
     except Exception:
         return None
 
@@ -256,17 +275,33 @@ def reconstruct(db_path, media_root, out_dir, contacts=None, owner="Me",
     flush(cur_cid, buf)
     con.close()
 
-    # evidence manifest for the whole run
-    man_csv = os.path.join(out_dir, "backup_chats.csv")
-    with open(man_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["#", "chat", "number", "is_group", "messages", "media", "first", "last",
-                    "zip", "sha256"])
-        for i, m in enumerate(sorted(manifests, key=lambda x: x["last"] or "", reverse=True), 1):
-            w.writerow([i, m["title"], m["number"], int(m["is_group"]), m["messages"], m["media"],
-                        m["first"], m["last"], m["zip"], m["sha256"]])
-    emit(f"reconstructed {len(manifests)} chats -> {out_dir} (manifest: {os.path.basename(man_csv)})")
+    # evidence manifest for the whole run. NEVER overwrite an existing manifest (it may be the
+    # record of a prior collection), and write it atomically so a crash can't leave it half-written.
+    man_csv = _unique_path(out_dir, "backup_chats.csv")
+    rows_out = [["#", "chat", "number", "is_group", "messages", "rows", "media",
+                 "first_utc", "last_utc", "first_ms", "last_ms", "zip", "sha256"]]
+    for i, m in enumerate(sorted(manifests, key=lambda x: x["last_ms"] or 0, reverse=True), 1):
+        rows_out.append([i, m["title"], m["number"], int(m["is_group"]), m["messages"], m["rows"],
+                         m["media"], m["first_utc"], m["last_utc"], m["first_ms"], m["last_ms"],
+                         m["zip"], m["sha256"]])
+    tmp = man_csv + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows_out)
+    os.replace(tmp, man_csv)
+    emit(f"reconstructed {len(manifests)} chats -> {out_dir} "
+         f"(manifest: {os.path.basename(man_csv)} sha256={bt.sha256(man_csv)[:16]}...)")
     return manifests
+
+
+def _unique_path(directory, filename):
+    """A path in `directory` that does not already exist: 'name.ext', then 'name (1).ext', ... so an
+    existing file (e.g. a prior run's manifest - potential evidence) is never overwritten."""
+    base, ext = os.path.splitext(filename)
+    cand, n = os.path.join(directory, filename), 1
+    while os.path.exists(cand):
+        cand = os.path.join(directory, f"{base} ({n}){ext}")
+        n += 1
+    return cand
 
 
 def _resolve_media_root(media_root):
@@ -283,15 +318,16 @@ def _resolve_media_root(media_root):
 
 def _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, owner,
                     copy_media, emit):
-    lines, attach, first_ts, last_ts, nmed = [], [], None, None, 0
+    lines, attach = [], []
+    first_ms = last_ms = None
+    emitted = 0                                   # messages actually RENDERED into _chat.txt
+    nmed = 0
     for _id, _cid, from_me, sender_rid, ts, mtype, text in rows:
-        dt = _ts_to_ios(ts)
+        dt = _ts_utc(ts)
         if dt is None:
             continue
-        first_ts = first_ts or dt
-        last_ts = dt
         who = owner if from_me else res.display(sender_rid)
-        stamp = dt.strftime("[%d/%m/%Y, %H:%M:%S]")
+        stamp = dt.strftime("[%d/%m/%Y, %H:%M:%S]")  # UTC
         body = (text or "").replace("\r\n", "\n").strip()
         mi = media.get(_id)
         if mi:
@@ -303,7 +339,12 @@ def _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, o
             nmed += 1
         elif body:
             lines.append(f"{stamp} {who}: {body}")
-        # system/empty messages (no text, no media) are skipped
+        else:
+            continue                              # system/empty row: NOT counted as a message
+        emitted += 1
+        if first_ms is None:
+            first_ms = ts
+        last_ms = ts
     if not lines:
         return None
 
@@ -330,21 +371,49 @@ def _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, o
                         seen.add(base)
                     except Exception:
                         pass
-    return {"title": title, "number": number, "is_group": is_group, "messages": len(rows),
-            "media": nmed, "first": first_ts.strftime("%Y-%m-%d %H:%M:%S") if first_ts else "",
-            "last": last_ts.strftime("%Y-%m-%d %H:%M:%S") if last_ts else "",
+    def _iso(ms):
+        d = _ts_utc(ms)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ") if d else ""
+    return {"title": title, "number": number, "is_group": is_group,
+            "messages": emitted,                  # RENDERED messages, matches _chat.txt
+            "rows": len(rows),                    # raw DB rows for this chat (incl. system/empty)
+            "media": nmed,
+            "first_utc": _iso(first_ms), "last_utc": _iso(last_ms),
+            "first_ms": first_ms or "", "last_ms": last_ms or "",   # raw source epoch, never lost
             "zip": os.path.basename(zip_path), "sha256": bt.sha256(zip_path)}
 
 
+def _within(root, path):
+    """True iff `path` (resolved, symlinks included) is inside `root`. Prevents a database-controlled
+    file_path like '../../secret' or an absolute path from pulling a file OUTSIDE the media root into
+    an evidence zip (traversal / local-file disclosure)."""
+    try:
+        root_r = os.path.realpath(root)
+        path_r = os.path.realpath(path)
+        return os.path.commonpath([root_r, path_r]) == root_r
+    except (ValueError, OSError):      # ValueError: different drives on Windows
+        return False
+
+
 def _find_media_file(mroot, rel, base):
-    """Locate a media file by its stored relative path, then by basename anywhere under Media."""
-    cand = os.path.join(mroot, rel.replace("/", os.sep))
-    if os.path.isfile(cand):
-        return cand
+    """Locate a media file for an attachment. The stored `rel` (message_media.file_path) is UNTRUSTED
+    DB content: reject absolute paths and any '..' traversal, and require the resolved file to stay
+    inside the media root. Fallback search is confined to the Media subtree by basename only."""
+    rel = (rel or "").replace("\\", "/")
+    if rel and not rel.startswith("/") and ".." not in rel.split("/"):
+        cand = os.path.join(mroot, *rel.split("/"))
+        if os.path.isfile(cand) and _within(mroot, cand):
+            return cand
+    safe_base = os.path.basename(base or "")        # never let base carry a path component
+    if not safe_base:
+        return None
     mediadir = os.path.join(mroot, "Media")
-    for root, _dirs, files in os.walk(mediadir if os.path.isdir(mediadir) else mroot):
-        if base in files:
-            return os.path.join(root, base)
+    searchdir = mediadir if os.path.isdir(mediadir) else mroot
+    for root, _dirs, files in os.walk(searchdir):
+        if safe_base in files:
+            hit = os.path.join(root, safe_base)
+            if _within(mroot, hit):
+                return hit
     return None
 
 

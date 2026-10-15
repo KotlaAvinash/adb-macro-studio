@@ -134,6 +134,12 @@ def _norm_name(s):
     return _WS_RE.sub(" ", s).strip()
 
 
+def duplicate_names(names):
+    """Names that appear more than once in `names` (F-10: same-display-name chats are tracked as one
+    because status is keyed by name; surfacing co-visible duplicates lets the operator disambiguate)."""
+    return {n for n in names if names.count(n) > 1}
+
+
 def _fingerprint(s):
     """Loose identity key for a chat name: lowercase letters+digits of ANY script, with
     whitespace/punctuation/emoji/direction-marks removed. Used to catch the SAME chat read with a
@@ -1372,6 +1378,7 @@ class RollingBatch(threading.Thread):
         self.only_names = None           # if set (a set of names), export ONLY these; skip others
         self.scan_order = None           # a pre-scanned ordered list of names (for directional seek)
         self._done_fps = set()           # fingerprints of finished chats (loop/duplicate guard)
+        self._dup_warned = set()         # names already flagged as ambiguous duplicates (F-10)
 
     def stop(self):
         self._stop.set()
@@ -1699,6 +1706,16 @@ class RollingBatch(threading.Thread):
                             self.emit("discover", nm)
                             if not sel:
                                 self.emit("row", nm, "skipped")
+                    # F-10: two chats with the SAME display name are tracked as one (status is keyed
+                    # by name). We cannot fully disambiguate without a durable per-chat id, so SURFACE
+                    # it: if the same name is on screen more than once, warn (once) so the operator
+                    # renames one - instead of a silently-incomplete CSV.
+                    for dup in duplicate_names(visible):
+                        if dup not in self._dup_warned:
+                            self._dup_warned.add(dup)
+                            self.emit("log", f"WARNING ambiguous-duplicate: {dup!r} appears more than "
+                                      "once on screen; only one is tracked - rename one on the phone "
+                                      "to export both")
                     self._write_csv()
                     # only TAP chats that are fully on screen: a row clipped at the top/bottom edge
                     # can put the tap on the navigation bar. If the next pending chat is clipped,
