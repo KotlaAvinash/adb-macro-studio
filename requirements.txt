@@ -9,3 +9,8 @@
 # fully hands-off. Delete this line if you'd rather add nothing and click Accept yourself —
 # everything else still works exactly the same.
 pywinauto ; sys_platform == "win32"
+
+# ---- optional, for the read-only backup extraction (wa_backup.py) ----
+# Only needed to DECRYPT a WhatsApp .crypt15 backup. Not imported unless you use that feature.
+#   pip install wa-crypt-tools
+# wa-crypt-tools

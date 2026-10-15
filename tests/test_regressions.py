@@ -555,5 +555,162 @@ class TestBackupReconstruct(unittest.TestCase):
         self.assertTrue(all(len(s) <= 3 for s in seen))      # ls commands, device handles the glob
 
 
+# ----------------------------------------------------------------- security-review remediations
+class TestSecurityReview(unittest.TestCase):
+    def _db(self, extra_media=None):
+        import wa_backup  # noqa
+        d = tempfile.mkdtemp()
+        db = os.path.join(d, "msgstore.db")
+        _msgstore(db, with_media_root=(d if extra_media else None))
+        return d, db
+
+    # F-01: existing manifest must never be overwritten; new one is atomic + distinct
+    def test_f01_manifest_never_overwritten(self):
+        import wa_backup
+        d, db = self._db()
+        out = os.path.join(d, "out"); os.makedirs(out)
+        man = os.path.join(out, "backup_chats.csv")
+        with open(man, "w") as f:
+            f.write("DO-NOT-OVERWRITE")
+        wa_backup.reconstruct(db, None, out, copy_media=False, emit=lambda m: None)
+        with open(man) as f:
+            self.assertEqual(f.read(), "DO-NOT-OVERWRITE")        # prior manifest intact
+        import glob
+        self.assertTrue(glob.glob(os.path.join(out, "backup_chats (1).csv")))
+        self.assertFalse(os.path.exists(man + ".tmp"))           # atomic: no temp left
+
+    # F-02: a DB media path must not escape the media root
+    def test_f02_media_path_traversal_blocked(self):
+        import wa_backup
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "Media"))
+        with open(os.path.join(os.path.dirname(root), "outside.txt"), "w") as f:
+            f.write("SECRET")
+        self.assertIsNone(wa_backup._find_media_file(root, "../outside.txt", "outside.txt"))
+        self.assertIsNone(wa_backup._find_media_file(root, "/etc/passwd", "passwd"))
+        # a legitimate in-root file still resolves
+        img = os.path.join(root, "Media", "WhatsApp Images")
+        os.makedirs(img)
+        with open(os.path.join(img, "IMG-1.jpg"), "wb") as f:
+            f.write(b"\xff\xd8ok")
+        self.assertIsNotNone(
+            wa_backup._find_media_file(root, "Media/WhatsApp Images/IMG-1.jpg", "IMG-1.jpg"))
+
+    # F-05: manifest message count = rendered messages (not raw rows incl. system); UTC + epoch kept
+    def test_f05_counts_and_utc_timestamps(self):
+        import wa_backup, csv as _csv
+        d, db = self._db()
+        out = os.path.join(d, "out")
+        mans = wa_backup.reconstruct(db, None, out, copy_media=False, emit=lambda m: None)
+        for m in mans:
+            self.assertLessEqual(m["messages"], m["rows"])       # emitted <= raw rows
+            self.assertTrue(m["first_utc"].endswith("Z"))        # UTC, unambiguous
+            self.assertIsInstance(m["first_ms"], int)            # raw epoch retained
+        # the rendered _chat.txt line count equals the manifest 'messages' for a chat
+        import glob, zipfile as _zip
+        z = glob.glob(os.path.join(out, "*Alice*"))[0]
+        with _zip.ZipFile(z) as zf:
+            txt = zf.read("_chat.txt").decode("utf-8")
+        import chat_viewer as cv
+        rendered = len(cv.parse_chat_text(txt))
+        m = [x for x in mans if "Alice" in x["title"]][0]
+        self.assertEqual(rendered, m["messages"])
+
+    # F-03: viewer rejects a zip-bomb member before decompressing it
+    def test_f03_zip_bomb_rejected(self):
+        import chat_viewer as cv, zipfile as _zip, io
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "bomb.zip")
+        with _zip.ZipFile(p, "w", _zip.ZIP_DEFLATED) as z:
+            z.writestr("_chat.txt", "[01/01/2026, 00:00:00] A: hi")
+            z.writestr("big.bin", b"\x00" * (50 * 1024 * 1024))   # 50MB of zeros -> huge ratio
+        old = cv.MAX_ZIP_MEMBER
+        try:
+            cv.MAX_ZIP_MEMBER = 1 * 1024 * 1024                  # 1MB cap for the test
+            self.assertIsNotNone(cv._zip_policy_violation(_zip.ZipFile(p)))
+            self.assertIsNone(cv.load_zip(p, 0))                 # skipped, not loaded
+        finally:
+            cv.MAX_ZIP_MEMBER = old
+        # a normal small zip still loads
+        ok = os.path.join(d, "ok.zip")
+        with _zip.ZipFile(ok, "w") as z:
+            z.writestr("_chat.txt", "[01/01/2026, 00:00:00] A: hi")
+        self.assertIsNone(cv._zip_policy_violation(_zip.ZipFile(ok)))
+
+    # F-04: branch/wait timeout honours the real wall-clock budget (was ~45% of it)
+    def test_f04_branch_timeout_is_wall_clock(self):
+        import adb_core as core
+        polls = {"n": 0}
+
+        class A:
+            input_gen = 0
+            def ui_dump(self):
+                polls["n"] += 1
+                return "<hierarchy></hierarchy>"       # never matches
+        clock = {"t": 1000.0}
+        r = core.MacroRunner.__new__(core.MacroRunner)
+        r.adb = A()
+        r._stop = Ev()
+        r.sleep = lambda s: (clock.__setitem__("t", clock["t"] + s) or r._stop.is_set())
+        with mock.patch.object(core.time, "monotonic", lambda: clock["t"]):
+            r._branch_wait("nope", "contains", "", 10.0)
+        self.assertGreaterEqual(clock["t"] - 1000.0, 9.9)        # ~10s elapsed, not ~4.5s
+        self.assertGreaterEqual(polls["n"], 9)
+
+    # F-06: a macro with an invalid launch package / bad field type is rejected at load
+    def test_f06_macro_validation(self):
+        import adb_core as core, json
+        d = tempfile.mkdtemp()
+        def write(obj):
+            p = os.path.join(d, "m.json")
+            with open(p, "w") as f:
+                json.dump(obj, f)
+            return p
+        with self.assertRaises(ValueError):
+            core.load_macro(write({"steps": [{"type": "launch", "package": "evil; rm -rf /"}]}))
+        with self.assertRaises(ValueError):
+            core.load_macro(write({"steps": [{"type": "tap", "x": "not-a-number", "y": 1}]}))
+        with self.assertRaises(ValueError):
+            core.load_macro(write({"steps": [{"type": "wait", "seconds": -5}]}))
+        # a valid macro loads
+        core.load_macro(write({"steps": [{"type": "launch", "package": "com.whatsapp"},
+                                         {"type": "tap", "x": 10, "y": 20}]}))
+
+    # F-06/launch guard: Adb.launch refuses a bad package even if constructed directly
+    def test_f06_launch_rejects_bad_package(self):
+        import adb_core as core
+        a = core.Adb("adb", "SER")
+        with self.assertRaises(core.AdbError):
+            a.launch("evil; reboot")
+
+    # F-07: typed text is redacted in the logged adb command
+    def test_f07_input_text_redacted_in_log(self):
+        import adb_core as core
+        self.assertEqual(core._redact_cmd(["shell", "input", "text", "s3cret"]),
+                         ["shell", "input", "text", "<redacted>"])
+        self.assertEqual(core._redact_cmd(["shell", "input", "tap", "1", "2"]),
+                         ["shell", "input", "tap", "1", "2"])   # non-text untouched
+
+    # F-10: co-visible same-name chats are surfaced (not silently merged)
+    def test_f10_duplicate_names_detected(self):
+        self.assertEqual(wb.duplicate_names(["A", "B", "A", "C"]), {"A"})
+        self.assertEqual(wb.duplicate_names(["A", "B", "C"]), set())
+
+    # F-08: verify_case recomputes hashes and reports any tamper
+    def test_f08_verify_case_detects_tamper(self):
+        import adb_core as core
+        d = tempfile.mkdtemp()
+        case = core.CaseLog(d, "SER")
+        f = case.dir / "evidence.txt"
+        f.write_text("original")
+        case.record_file(f, "note")
+        self.assertEqual(core.verify_case(case.dir)["mismatch"], [])   # clean
+        f.write_text("TAMPERED")
+        r = core.verify_case(case.dir)
+        self.assertEqual([m[0] for m in r["mismatch"]], ["evidence.txt"])
+        f.unlink()
+        self.assertEqual(core.verify_case(case.dir)["missing"], ["evidence.txt"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

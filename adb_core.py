@@ -151,6 +151,20 @@ def png_size(data: bytes) -> tuple[int, int]:
 _SHELL_SPECIAL = set("\\'\"`$&|;<>()*?~!#[]{}")
 
 
+def _redact_cmd(parts):
+    """Redact the typed value from a logged `adb shell input text <value>` command so message text,
+    passcodes, etc. are not written verbatim into session.log. The command still RUNS with the real
+    value; only the log line is redacted."""
+    parts = list(parts)
+    try:
+        i = parts.index("input")
+        if parts[i + 1] == "text" and i + 2 < len(parts):
+            parts[i + 2] = "<redacted>"
+    except (ValueError, IndexError):
+        pass
+    return [str(p) for p in parts]
+
+
 def escape_input_text(s: str) -> str:
     """Escape text for `adb shell input text` (runs through the phone's sh)."""
     out = []
@@ -455,14 +469,57 @@ def save_macro(folder: Path, macro: dict) -> Path:
     return path
 
 
+PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")   # Android application-id
+_NUMERIC_FIELDS = {"x", "y", "x2", "y2", "duration", "seconds", "timeout", "delay"}
+_MAX_STEPS = 5000
+_MAX_BRANCH_DEPTH = 8
+
+
+def _validate_steps(steps, where, depth=0, counter=None):
+    """Recursively validate a macro step list: known type, correct field value types, bounded
+    numbers, a valid Android package for 'launch', and bounded nesting/size. A macro file is
+    UNTRUSTED input (it may be a shared preset), so values are checked before any of them can reach
+    a device command - not merely the step 'type'."""
+    if counter is None:
+        counter = [0]
+    if depth > _MAX_BRANCH_DEPTH:
+        raise ValueError(f"{where}: branch nesting deeper than {_MAX_BRANCH_DEPTH}")
+    if not isinstance(steps, list):
+        raise ValueError(f"{where}: 'steps' must be a list")
+    for i, s in enumerate(steps, 1):
+        counter[0] += 1
+        if counter[0] > _MAX_STEPS:
+            raise ValueError(f"{where}: more than {_MAX_STEPS} steps")
+        if not isinstance(s, dict):
+            raise ValueError(f"{where}: step {i} is not an object")
+        t = s.get("type")
+        if t not in STEP_FIELDS:
+            raise ValueError(f"{where}: step {i} has unknown type {t!r}")
+        for key, val in s.items():
+            if key in _NUMERIC_FIELDS:
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    raise ValueError(f"{where}: step {i} field {key!r} must be a number, got {val!r}")
+                if not (0 <= float(val) <= 86_400):
+                    raise ValueError(f"{where}: step {i} field {key!r} out of range: {val!r}")
+            elif key in ("text", "match", "or_text", "key", "name", "remote", "local", "package",
+                         "label", "type"):
+                if not isinstance(val, str):
+                    raise ValueError(f"{where}: step {i} field {key!r} must be a string")
+        if t == "launch":
+            pkg = s.get("package", "com.whatsapp")
+            if not PACKAGE_RE.fullmatch(pkg or ""):
+                raise ValueError(f"{where}: step {i} invalid Android package {pkg!r}")
+        if t == "if_text":
+            _validate_steps(s.get("then", []) or [], where, depth + 1, counter)
+            _validate_steps(s.get("else", []) or [], where, depth + 1, counter)
+
+
 def load_macro(path: Path) -> dict:
     macro = json.loads(Path(path).read_text(encoding="utf-8"))
     steps = macro.get("steps")
     if not isinstance(steps, list):
         raise ValueError(f"{path}: 'steps' must be a list")
-    for i, s in enumerate(steps, 1):
-        if s.get("type") not in STEP_FIELDS:
-            raise ValueError(f"{path}: step {i} has unknown type {s.get('type')!r}")
+    _validate_steps(steps, str(path))
     return macro
 
 
@@ -484,6 +541,35 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def verify_case(case_dir) -> dict:
+    """Recompute SHA-256 for every file listed in a case's hashes.csv and report discrepancies.
+    Returns {checked, ok, mismatch:[(rel,recorded,actual)], missing:[rel]}. This is the integrity
+    CHECK the review asked for (F-08): hashes are still ordinary CSV, so this does not by itself make
+    the chain tamper-EVIDENT, but it lets anyone re-verify that recorded artifacts are unchanged."""
+    case_dir = Path(case_dir)
+    hp = case_dir / "hashes.csv"
+    out = {"checked": 0, "ok": 0, "mismatch": [], "missing": []}
+    if not hp.exists():
+        return out
+    with open(hp, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rel = row.get("file")
+            recorded = (row.get("sha256") or "").strip()
+            if not rel:
+                continue
+            out["checked"] += 1
+            p = case_dir / rel
+            if not p.is_file():
+                out["missing"].append(rel)
+                continue
+            actual = sha256_file(p)
+            if actual == recorded:
+                out["ok"] += 1
+            else:
+                out["mismatch"].append((rel, recorded, actual))
+    return out
 
 
 class CaseLog:
@@ -549,7 +635,7 @@ class Adb:
     def run(self, *args, timeout=60, quiet=False) -> bytes:
         c = self.cmd(*args)
         if not quiet:
-            self.log("adb " + " ".join(c[1:]))
+            self.log("adb " + " ".join(_redact_cmd(c[1:])))
         try:
             p = subprocess.run(c, capture_output=True, timeout=timeout,
                                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
@@ -641,6 +727,8 @@ class Adb:
         self.shell("input", "keyevent", key_code(k))
 
     def launch(self, package: str):
+        if not PACKAGE_RE.fullmatch(package or ""):   # never let an odd value reach the device shell
+            raise AdbError(f"refusing to launch invalid package name {package!r}")
         self.input_gen += 1
         out = self.shell("monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1")
         if "No activities found" in out or "monkey aborted" in out:
@@ -834,9 +922,11 @@ class MacroRunner(threading.Thread):
 
     def _branch_wait(self, query, match, or_text, timeout) -> bool:
         """Poll the screen: True as soon as `query` appears, False if `or_text`
-        appears first or the timeout elapses."""
-        deadline = timeout
-        while True:
+        appears first or the timeout elapses. Uses a real monotonic deadline so the configured
+        timeout is the WALL-CLOCK budget - it previously subtracted 2.2s per 1s poll, so a 60s
+        timeout actually expired in ~27s and could take the wrong branch before a slow screen."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
             try:
                 nodes = parse_ui_nodes(self.adb.ui_dump())
                 if query and find_node(nodes, query, match):
@@ -845,20 +935,20 @@ class MacroRunner(threading.Thread):
                     return False
             except AdbError:
                 pass
-            if deadline <= 0 or self.sleep(1.0):
+            if self.sleep(min(1.0, max(0.0, deadline - time.monotonic()))):
                 return False
-            deadline -= 1.0 + 1.2
+        return False
 
     def _wait_for(self, query, match, timeout):
         self.adb.log(f"looking for \"{query}\" on screen (uiautomator)")
-        deadline = timeout
-        while True:
+        deadline = time.monotonic() + max(0.0, float(timeout))   # real wall-clock budget (see _branch_wait)
+        while time.monotonic() < deadline:
             try:
                 node = find_node(parse_ui_nodes(self.adb.ui_dump()), query, match)
                 if node:
                     return node
             except AdbError as e:  # "could not get idle state" while the screen animates
                 self.emit("log", f"UI dump retry: {e}")
-            if deadline <= 0 or self.sleep(1.0):
+            if self.sleep(min(1.0, max(0.0, deadline - time.monotonic()))):
                 raise TimeoutError(f"\"{query}\" not found on screen within {timeout:g} s")
-            deadline -= 1.0 + 1.2  # sleep + typical dump time
+        raise TimeoutError(f"\"{query}\" not found on screen within {timeout:g} s")
