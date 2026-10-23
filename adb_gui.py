@@ -923,7 +923,7 @@ class App:
         except AdbError as e:
             self._log(f"!! {e}")
             return
-        labels = [f"{d['serial']}  [{d['state']}]" for d in devs]
+        labels = [core.device_label(d) for d in devs]
         self.dev_box["values"] = labels
         self._devs = devs
         if labels and not self.dev_var.get():
@@ -952,7 +952,7 @@ class App:
         self.case.write(f"connected {info}")
         self.info_lbl.config(
             text=f"{info['manufacturer']} {info['model']} | Android {info['android']} "
-                 f"| {info['width']}x{info['height']} | {self.serial}")
+                 f"| {info['width']}x{info['height']} | {info['device']}")
         self._log(f"connected: {info['model']} ({info['width']}x{info['height']})")
         self._log(f"case folder: {self.case.dir}")
         self.refresh_macros()
@@ -1086,6 +1086,7 @@ class App:
         t.start()
 
     def _live_loop(self):
+        streak = core.FailStreak()      # a disconnected phone logs once, not every frame
         while not self._live_stop.is_set():
             if self.live_var.get() and self.adb:
                 # Keep MIRRORING even while a batch/scan is running (so you can watch what adb is
@@ -1095,8 +1096,13 @@ class App:
                 try:
                     png = self.adb.screencap()
                     self.q.put(("liveframe", png))
+                    msg = streak.ok("live view resumed")
+                    if msg:
+                        self.q.put(("log", msg))
                 except Exception as e:
-                    self.q.put(("log", f"live view: {e}"))
+                    msg = streak.fail(f"live view paused (retrying quietly): {e}")
+                    if msg:
+                        self.q.put(("log", msg))
                     self._live_stop.wait(2.0)
                 self._live_stop.wait((LIVE_INTERVAL_MS * 3 if busy else LIVE_INTERVAL_MS) / 1000)
                 continue
@@ -1316,7 +1322,7 @@ class App:
         macro = {
             "name": name,
             "created": now_iso(),
-            "device": {"serial": self.serial, "size": list(self.cur_size)},
+            "device": {"tag": core.device_tag(self.serial), "size": list(self.cur_size)},
             "ref_size": list(self.cur_size) if self.cur_size != (0, 0) else None,
             "steps": self.steps,
         }
@@ -1342,7 +1348,7 @@ class App:
         macro = {
             "name": name.strip(),
             "created": now_iso(),
-            "device": {"serial": self.serial, "size": list(self.cur_size)},
+            "device": {"tag": core.device_tag(self.serial), "size": list(self.cur_size)},
             "ref_size": list(self.cur_size) if self.cur_size != (0, 0) else None,
             "steps": steps,
         }

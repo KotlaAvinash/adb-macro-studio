@@ -66,7 +66,7 @@ class Cli:
             print("  No devices. Plug in the phone, enable USB debugging, accept the RSA prompt.")
             return
         for i, d in enumerate(devs, 1):
-            print(f"   {i}. {d['serial']}  [{d['state']}]  {d.get('model','')}")
+            print(f"   {i}. {core.device_label(d)}")
         sel = self._ask("Pick #", 1)
         if not (sel.isdigit() and 1 <= int(sel) <= len(devs)):
             return
@@ -167,7 +167,7 @@ class Cli:
         macro = {
             "name": self.name,
             "created": core.now_iso(),
-            "device": {"serial": self.serial, "size": list(self.cur_size)},
+            "device": {"tag": core.device_tag(self.serial), "size": list(self.cur_size)},
             "ref_size": list(self.cur_size) if self.cur_size != (0, 0) else None,
             "steps": self.steps,
         }
@@ -277,7 +277,7 @@ class Cli:
             if not find_scrcpy(self.adb_path):
                 print("  (tip: install scrcpy next to adb for a live mirror while you record)")
         while True:
-            dev = self.serial or "none"
+            dev = core.device_tag(self.serial) if self.serial else "none"
             print(f"""
   Device: {dev} | Size: {self.cur_size[0]}x{self.cur_size[1]} | Steps: {len(self.steps)} | Macro: {self.name}
   ----------------------------------------------------------------

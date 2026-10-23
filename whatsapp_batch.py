@@ -342,7 +342,7 @@ def _device_wait_reason(adb_path):
     if not devs:
         return ("waiting for device - none detected. Check the USB cable/port, keep the phone "
                 "UNLOCKED, and make sure File Transfer (MTP) + USB debugging are on.")
-    states = ", ".join(f"{d.get('serial','?')}={d.get('state','?')}" for d in devs)
+    states = ", ".join(f"{core.device_tag(d.get('serial'))}={d.get('state','?')}" for d in devs)
     if any(d.get("state") == "unauthorized" for d in devs):
         return (f"waiting for device - UNAUTHORIZED ({states}). Unlock the phone and tap "
                 "'Allow'/'Always allow' on the USB-debugging prompt.")
@@ -1311,12 +1311,30 @@ def _csv_unsafe(s):
 CSV_HEADER = ["#", "chat", "status", "media", "saved_file", "sha256", "time"]
 
 
+_CSV_FALLBACK = {}        # target csv -> side file used while the target is locked (this run)
+_REPLACE_TRIES = 5        # a briefly locked CSV (antivirus/indexer) is retried before falling back
+
+
+def _unsaved_path(path):
+    """A new side-file name next to `path`: exported_chats.unsaved-<stamp>.csv."""
+    base = path[:-4] if path.lower().endswith(".csv") else path
+    cand = f"{base}.unsaved-{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    n = 1
+    while os.path.exists(cand):
+        cand = f"{base}.unsaved-{time.strftime('%Y%m%d_%H%M%S')}-{n}.csv"
+        n += 1
+    return cand
+
+
 def write_csv_atomic(path, rows, log=lambda m: None):
     """Write the exported-chats CSV so it can NEVER be lost (it's evidence):
     - writes to a temp file then atomically replaces the target (a crash mid-write can't corrupt it);
     - makes the parent folder if missing;
     - REFUSES to overwrite an existing non-empty CSV with an EMPTY table (so a failed/empty run
-      never erases prior progress)."""
+      never erases prior progress);
+    - if the target is LOCKED (Windows refuses the replace while the CSV is open, e.g. in Excel),
+      retries briefly, then saves the update to a side file 'exported_chats.unsaved-<stamp>.csv'.
+      The update used to be discarded here, losing that progress."""
     try:
         if not rows:
             if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -1330,7 +1348,26 @@ def write_csv_atomic(path, rows, log=lambda m: None):
             wr.writerow(CSV_HEADER)
             for r in rows:
                 wr.writerow(r)
-        os.replace(tmp, path)                # atomic on the same filesystem
+        tries = 1 if path in _CSV_FALLBACK else _REPLACE_TRIES   # known-locked: don't stall each chat
+        for attempt in range(tries):
+            try:
+                os.replace(tmp, path)        # atomic on the same filesystem
+                _CSV_FALLBACK.pop(path, None)
+                return
+            except PermissionError:
+                if attempt + 1 < tries:
+                    time.sleep(0.4 * (attempt + 1))
+        side = _CSV_FALLBACK.get(path) or _unsaved_path(path)
+        try:
+            os.replace(tmp, side)
+        except PermissionError:              # the side file itself got opened: start a new one
+            side = _unsaved_path(path)
+            os.replace(tmp, side)
+        if path not in _CSV_FALLBACK:
+            log(f"CSV LOCKED: '{os.path.basename(path)}' is open in another program (Excel?) - "
+                f"progress saved to '{os.path.basename(side)}'. Close the CSV and it is updated "
+                "again on the next write.")
+        _CSV_FALLBACK[path] = side
     except Exception as e:
         log(f"csv write failed: {e}")
         try:
@@ -1341,15 +1378,20 @@ def write_csv_atomic(path, rows, log=lambda m: None):
 
 
 def latest_csv_for_serial(cases_dir, serial):
-    """Find the most recent non-empty exported_chats.csv for THIS device (its serial is in the
-    case folder name, '<timestamp>_<serial>'). Returns the path or None. This is how a restart on
-    the SAME mobile continues the SAME CSV, while a DIFFERENT mobile (different serial) gets none
-    and starts fresh."""
+    """Find the most recent non-empty exported-chats CSV for THIS device. Case folders are named
+    '<timestamp>_<device tag>' (older ones '<timestamp>_<serial>'). Side files saved while the CSV
+    was locked ('exported_chats.unsaved-<stamp>.csv') count too, so the newest progress wins.
+    Returns the path or None. This is how a restart on the SAME mobile continues the SAME CSV,
+    while a DIFFERENT mobile gets none and starts fresh."""
     if not serial:
         return None
     import glob
-    pat = os.path.join(str(cases_dir), f"*_{serial}", "exported_chats.csv")
-    found = [c for c in glob.glob(pat) if os.path.isfile(c) and os.path.getsize(c) > 0]
+    found = []
+    for folder in {core.device_tag(serial), core.safe_name(serial)}:
+        pat = os.path.join(glob.escape(str(cases_dir)), f"*_{glob.escape(folder)}",
+                           "exported_chats*.csv")
+        found += [c for c in glob.glob(pat)
+                  if os.path.isfile(c) and os.path.getsize(c) > 0]
     if not found:
         return None
     return max(found, key=os.path.getmtime)

@@ -112,6 +112,41 @@ def safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "item"
 
 
+def device_tag(serial) -> str:
+    """A stable pseudonym for a device serial ('dev-' + 10 hex of its sha256). Used in folder
+    names, logs and on screen so the raw serial (a personal identifier) is never written out,
+    while the same phone still maps to the same tag (resume keeps working)."""
+    if not serial:
+        return "unknown"
+    return "dev-" + hashlib.sha256(str(serial).encode("utf-8")).hexdigest()[:10]
+
+
+def device_label(d: dict) -> str:
+    """Device-picker text: model + tag + adb state, never the raw serial."""
+    model = (d.get("model") or "").strip()
+    tag = device_tag(d.get("serial"))
+    return f"{model + '  ' if model else ''}{tag}  [{d.get('state', '?')}]"
+
+
+class FailStreak:
+    """Report a repeating failure once, and the recovery once (instead of one log line per try)."""
+
+    def __init__(self):
+        self.failing = False
+
+    def fail(self, msg):
+        if self.failing:
+            return None
+        self.failing = True
+        return msg
+
+    def ok(self, msg):
+        if not self.failing:
+            return None
+        self.failing = False
+        return msg
+
+
 def parse_devices(text: str) -> list[dict]:
     out = []
     for line in text.splitlines():
@@ -573,10 +608,10 @@ def verify_case(case_dir) -> dict:
 
 
 class CaseLog:
-    """cases/<stamp>_<serial>/ with session.log (every adb command) and hashes.csv."""
+    """cases/<stamp>_<device tag>/ with session.log (every adb command) and hashes.csv."""
 
     def __init__(self, root: Path, serial: str):
-        self.dir = Path(root) / f"{now_stamp()}_{safe_name(serial)}"
+        self.dir = Path(root) / f"{now_stamp()}_{device_tag(serial)}"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.dir / "session.log"
         self.hash_path = self.dir / "hashes.csv"
@@ -632,18 +667,23 @@ class Adb:
         base = [self.path] + (["-s", self.serial] if self.serial else [])
         return base + [str(a) for a in args]
 
+    def _scrub(self, text: str) -> str:
+        """Replace the raw serial with its tag in anything that is logged or shown."""
+        return text.replace(self.serial, device_tag(self.serial)) if self.serial else text
+
     def run(self, *args, timeout=60, quiet=False) -> bytes:
         c = self.cmd(*args)
+        shown = self._scrub(" ".join(_redact_cmd(c[1:])))
         if not quiet:
-            self.log("adb " + " ".join(_redact_cmd(c[1:])))
+            self.log("adb " + shown)
         try:
             p = subprocess.run(c, capture_output=True, timeout=timeout,
                                stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
         except subprocess.TimeoutExpired:
-            raise AdbError(f"adb {' '.join(c[1:])} timed out after {timeout}s") from None
+            raise AdbError(f"adb {shown} timed out after {timeout}s") from None
         if p.returncode != 0:
-            msg = (p.stderr or p.stdout).decode("utf-8", "replace").strip()
-            raise AdbError(f"adb {' '.join(c[1:])} failed (exit {p.returncode}): {msg}")
+            msg = self._scrub((p.stderr or p.stdout).decode("utf-8", "replace").strip())
+            raise AdbError(f"adb {shown} failed (exit {p.returncode}): {msg}")
         return p.stdout
 
     def shell(self, *args, timeout=60, quiet=False) -> str:
@@ -664,7 +704,7 @@ class Adb:
             ("manufacturer", "ro.product.manufacturer"), ("model", "ro.product.model"),
             ("android", "ro.build.version.release"), ("sdk", "ro.build.version.sdk"),
             ("fingerprint", "ro.build.fingerprint"))}
-        info["serial"] = self.serial
+        info["device"] = device_tag(self.serial)
         info["width"], info["height"] = parse_wm_size(self.shell("wm", "size", quiet=True)) or (0, 0)
         dens = re.findall(r"density:\s*(\d+)", self.shell("wm", "density", quiet=True))
         info["density"] = int(dens[-1]) if dens else 0
