@@ -37,6 +37,8 @@ import bt_transfer as bt
 # WhatsApp's shared-storage locations (scoped-storage path first, then the legacy one).
 WA_DIRS = ("/sdcard/Android/media/com.whatsapp/WhatsApp",
            "/sdcard/WhatsApp")
+WA_BUSINESS_DIRS = ("/sdcard/Android/media/com.whatsapp.w4b/WhatsApp Business",
+                    "/sdcard/WhatsApp Business")
 _LTR = "‎"                                   # iOS export prefixes attachment lines with this
 
 
@@ -52,19 +54,28 @@ def _first_existing_dir(adb, candidates):
     return None
 
 
-def wa_dir(adb):
-    return _first_existing_dir(adb, WA_DIRS)
+def wa_dirs(package="com.whatsapp"):
+    return WA_BUSINESS_DIRS if package == "com.whatsapp.w4b" else WA_DIRS
 
 
-def newest_backup(adb):
+def wa_dir(adb, package="com.whatsapp"):
+    return _first_existing_dir(adb, wa_dirs(package))
+
+
+def _sh_quote(path):
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def newest_backup(adb, package="com.whatsapp"):
     """Path of the newest msgstore*.crypt1x on the phone, or None. Read-only (ls)."""
-    base = wa_dir(adb)
+    base = wa_dir(adb, package)
     if not base:
         return None
     dbdir = base + "/Databases"
     try:
         # one device-side command so the shell expands the glob and sorts by time (newest first)
-        out = adb.shell("ls -t " + dbdir + "/msgstore*.crypt1* 2>/dev/null", quiet=True) or ""
+        # quoted: WhatsApp Business's folder name has a space; the glob stays outside the quotes
+        out = adb.shell("ls -t " + _sh_quote(dbdir) + "/msgstore*.crypt1* 2>/dev/null", quiet=True) or ""
     except Exception:
         return None
     for line in out.splitlines():
@@ -74,9 +85,9 @@ def newest_backup(adb):
     return None
 
 
-def pull_backup(adb, dest_dir, emit=print):
+def pull_backup(adb, dest_dir, emit=print, package="com.whatsapp"):
     """adb pull the newest backup to dest_dir. Returns (local_path, sha256) or (None, None)."""
-    remote = newest_backup(adb)
+    remote = newest_backup(adb, package)
     if not remote:
         emit("no msgstore backup found on the phone (is WhatsApp installed / has it ever backed up?)")
         return None, None
@@ -92,9 +103,9 @@ def pull_backup(adb, dest_dir, emit=print):
     return local, digest
 
 
-def pull_media(adb, dest_dir, emit=print):
+def pull_media(adb, dest_dir, emit=print, package="com.whatsapp"):
     """adb pull the whole Media tree (can be large). Returns the local Media dir, or None."""
-    base = wa_dir(adb)
+    base = wa_dir(adb, package)
     if not base:
         return None
     os.makedirs(dest_dir, exist_ok=True)

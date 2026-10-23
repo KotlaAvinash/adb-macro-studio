@@ -27,13 +27,14 @@ import zipfile
 # ---- WhatsApp export line formats ---------------------------------------------------------
 # iOS:     [06/09/2024, 10:30:45] John Doe: message
 # Android: 06/09/2024, 10:30 - John Doe: message      (or "9/6/24, 10:30 AM - John: ...")
+# The date/time layout follows the PHONE's language: "2026-10-23 20:30", "23.10.26, 20:30",
+# "2026. 10. 23. 오후 8:30", a day-period word in any script before or after the time, and any
+# script's digits (\d is Unicode). So separators and the am/pm word are matched generically.
 _LTR = "\u200e\u200f"  # RTL/LTR marks WhatsApp sprinkles in
-_RE_IOS = re.compile(
-    r"^[%s]*\[(\d{1,2}[/.]\d{1,2}[/.]\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?\s*(?:[APap]\.?[Mm]\.?)?)\]\s*(.*)$" % _LTR
-)
-_RE_AND = re.compile(
-    r"^[%s]*(\d{1,2}[/.]\d{1,2}[/.]\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?\s*(?:[APap]\.?[Mm]\.?)?)\s+-\s+(.*)$" % _LTR
-)
+_DATE = r"\d{1,4}[^\d\s:]{1,2}\s?\d{1,2}[^\d\s:]{1,2}\s?\d{1,4}[^\d\s:,\]]{0,2}"
+_TIME = r"(?:[^\d\s\[\]-]{1,12}\s)?\d{1,2}[:.]\d{2}(?:[:.]\d{2})?(?:\s?[^\d\s\[\]-][^\s\]]{0,11})?"
+_RE_IOS = re.compile(r"^[%s]*\[(%s),?\s+(%s)\]\s*(.*)$" % (_LTR, _DATE, _TIME))
+_RE_AND = re.compile(r"^[%s]*(%s),?\s+(%s)\s+[-\u2013]\s+(.*)$" % (_LTR, _DATE, _TIME))
 # media reference forms inside a message
 _RE_ATTACHED = re.compile(r"<attached:\s*([^>]+)>", re.IGNORECASE)
 _RE_FILEATT = re.compile(r"([^\s]+\.[A-Za-z0-9]{2,4})\s*\(file attached\)", re.IGNORECASE)
@@ -78,8 +79,21 @@ def _split_sender(rest):
     return sender, rest[idx + 2:]
 
 
-def parse_chat_text(text):
-    """Parse a _chat.txt into a list of message dicts: {ts, sender, text, media_refs:[names]}."""
+def _strip_named_media(text, name):
+    """Remove one attachment mention, in any language: '<word: NAME>' (iOS), 'NAME (words)'
+    (Android) or the bare NAME."""
+    n = re.escape(name)
+    for rx in (r"<[^<>]*?:\s*%s\s*>" % n, r"%s\s*\([^()\n]*\)" % n, n):
+        text, k = re.subn(rx, "", text, count=1)
+        if k:
+            break
+    return text
+
+
+def parse_chat_text(text, media_names=()):
+    """Parse a _chat.txt into a list of message dicts: {ts, sender, text, media_refs:[names]}.
+    `media_names` = the attachment file names in the export; a message mentioning one of them
+    references it whatever words the phone's language wraps around the name."""
     msgs = []
     cur = None
     for raw in text.splitlines():
@@ -108,6 +122,10 @@ def parse_chat_text(text):
         # strip the media tokens from the visible text
         t = _RE_ATTACHED.sub("", mo["text"])
         t = _RE_FILEATT.sub("", t)
+        for name in sorted(media_names, key=len, reverse=True):
+            if name not in refs and name in t:
+                refs.append(name)
+                t = _strip_named_media(t, name)
         t = t.replace("<Media omitted>", "").strip(" \t" + _LTR)
         mo["text"] = t
         mo["media_refs"] = refs
@@ -170,7 +188,8 @@ def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
         return None
     raw = zf.read(txt_name)
     text = raw.decode("utf-8", "replace")
-    msgs = parse_chat_text(text)
+    msgs = parse_chat_text(text, {os.path.basename(n) for n in names
+                                  if not n.lower().endswith(".txt") and os.path.basename(n)})
 
     out_dir = None
     if mode == "folder":
