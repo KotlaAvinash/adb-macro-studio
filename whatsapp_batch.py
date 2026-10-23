@@ -58,6 +58,8 @@ def _save_coords():
     except Exception:
         pass
 
+accept_watcher = None     # a run's single qs_accept.AcceptWatcher (set while RollingBatch runs)
+
 # --- which WhatsApp ------------------------------------------------------------------------------
 WA_PACKAGES = {"com.whatsapp": "WhatsApp", "com.whatsapp.w4b": "WhatsApp Business"}
 
@@ -328,6 +330,208 @@ def on_chat_list(adb):
     return len(_chat_rows(nodes)) >= 2
 
 
+# ----------------------------------------------------------------- list navigation (any screen)
+# ONE scroller for every feature (scan, rolling export, export-selected, seek). It measures the
+# list on screen - its box and the row pitch - instead of using fixed fractions of the screen, so it
+# is the same on any screen size, density, font size or maker. Every page move is VERIFIED: the
+# last chat seen must still be on screen afterwards (a fling that overshoots is walked back), so no
+# chat can be skipped; and an end of the list is only accepted after swiping the other way and back
+# proves swipes are working (an ignored swipe looks exactly like the end of the list).
+ARCHIVED_ID = "archived_row"
+ALL_FILTER_ID = "conversations_filter_debug_view_id_all"
+
+
+def _list_geometry(nodes):
+    """(rows top->bottom, list top, list bottom, row pitch, list centre x), or None when no chat rows
+    are readable."""
+    rows = _chat_rows(nodes)
+    if not rows:
+        return None
+    tops = [r["node"]["bounds"][1] for r in rows]
+    lists = [n for n in nodes if n["id"].endswith("/list") and core._area(n) > 0]
+    if lists:
+        b = max(lists, key=core._area)["bounds"]
+        top, bottom, cx = b[1], b[3], (b[0] + b[2]) // 2
+    else:
+        top, bottom = tops[0], rows[-1]["node"]["bounds"][3]
+        cx = core.node_center(rows[0]["node"])[0]
+    gaps = sorted(b - a for a, b in zip(tops, tops[1:]) if b - a > 0)
+    hmax = max(r["node"]["bounds"][3] - r["node"]["bounds"][1] for r in rows)
+    pitch = gaps[len(gaps) // 2] if gaps else hmax * 3
+    return rows, top, bottom, max(pitch, 20), cx
+
+
+def _drag(adb, top, bottom, pitch, cx, dist, direction, fast=False):
+    """Drag the list by `dist` px inside its own box (never onto the toolbar / nav bar).
+    direction 'down' reveals later chats. Slow enough (~2 rows/s) not to fling unless `fast`."""
+    margin = max(8, pitch // 3)
+    room = (bottom - margin) - (top + margin)
+    dist = max(1, min(int(dist), room))
+    ms = 250 if fast else max(300, int(dist / (2.0 * pitch) * 1000))
+    if direction == "down":
+        y1 = bottom - margin
+        adb.swipe(cx, y1, cx, y1 - dist, ms)
+    else:
+        y1 = top + margin
+        adb.swipe(cx, y1, cx, y1 + dist, ms)
+    time.sleep(1.0 if fast else 0.6)
+    try:
+        adb._wb_moved = True             # the next tap must wait for the list to settle
+    except Exception:
+        pass
+
+
+def scroll_list(adb, direction="down", rows=None, fast=False):
+    """Move the chat list one page (or `rows` rows) and verify nothing was skipped.
+    Returns ('moved' | 'still' | 'unreadable', names now on screen)."""
+    geo = _list_geometry(_nodes(adb))
+    if geo is None:
+        return "unreadable", []
+    rows_now, top, bottom, pitch, cx = geo
+    before = [r["name"] for r in rows_now]
+    full = {r["name"] for r in rows_now if r["full"]}
+    if direction == "down":
+        anchor = next((n for n in reversed(before) if n in full), before[-1])
+    else:
+        anchor = next((n for n in before if n in full), before[0])
+    dist = (rows * pitch) if rows else (bottom - top) - 1.5 * pitch     # a page, keeping overlap
+    _drag(adb, top, bottom, pitch, cx, max(dist, pitch * 0.8), direction, fast=fast)
+    after = [nm for _, nm in visible_chats(adb)]
+    if not after:
+        return "unreadable", []
+    # moved = a chat we had not seen appeared. Comparing whole views is wrong on Android 12+: at an
+    # end the list STRETCHES (more for a fast swipe), so edge rows come and go without any scrolling
+    # - that made the end undetectable and the scroll never stop.
+    if not any(n not in before for n in after):
+        return "still", after
+    if fast:
+        return "moved", after
+    back = "up" if direction == "down" else "down"
+    for _ in range(12):                      # overshoot: walk back until the anchor is on screen
+        if anchor in after or any(n in before for n in after):
+            break
+        _drag(adb, top, bottom, pitch, cx, pitch, back)
+        after = [nm for _, nm in visible_chats(adb)]
+    return "moved", after
+
+
+def _settled_node(adb, finder, tries=5):
+    """The node `finder(nodes)` picks, read from a screen that has stopped moving. Right after a
+    scroll Android 12+ still shows the list stretched / settling, so positions from that read are
+    wrong and a tap there can open a DIFFERENT chat. After a scroll we re-read until the node is in
+    the same place twice."""
+    if not getattr(adb, "_wb_moved", False):
+        return finder(_nodes(adb))
+    prev = None
+    for i in range(tries):
+        if i:
+            time.sleep(0.4)                   # > the screen-read cache TTL: a fresh read
+        n = finder(_nodes(adb))
+        if n is not None and prev is not None and n["bounds"] == prev["bounds"]:
+            break
+        prev = n
+    else:
+        n = prev
+    try:
+        adb._wb_moved = False
+    except Exception:
+        pass
+    return n
+
+
+def opened_chat_matches(nodes, name):
+    """Is the open chat the one we meant? True / False, or None when no title is shown.
+    A wrong chat must never be exported under another chat's name."""
+    title = core.find_node(nodes, "conversation_contact_name", "exact")
+    if title is None or not title["text"]:
+        return None
+    got, want = _norm_name(title["text"]).lower(), _norm_name(name).lower()
+    if got.endswith(("…", "...")):                 # a long name shortened in the header
+        return want.startswith(got.rstrip(".…").rstrip())
+    return got == want
+
+
+def scroll_to_end(adb, direction="up", stop=None, max_swipes=600):
+    """Scroll to the very top ('up') or bottom ('down') of the list, and VERIFY it: two unchanged
+    reads may just be ignored swipes, so swipe the other way and back - only if that returns to the
+    same view is it really the end. Returns True when the end is confirmed."""
+    other = "down" if direction == "up" else "up"
+    stills = 0
+    for _ in range(max_swipes):
+        if stop is not None and stop.is_set():
+            return False
+        res, view = scroll_list(adb, direction, fast=(direction == "up"))
+        if res == "unreadable":
+            time.sleep(1.0)
+            continue
+        if res == "moved":
+            stills = 0
+            continue
+        stills += 1
+        if stills < 2:
+            continue
+        if _end_confirmed(adb, direction, other, view, stop):
+            return True
+        stills = 0
+    return False
+
+
+def _end_confirmed(adb, direction, other, view, stop):
+    for _ in range(3):                       # the probe swipe itself may be ignored: retry it
+        if stop is not None and stop.is_set():
+            return False
+        res, _probe = scroll_list(adb, other, rows=1.5)
+        if res == "moved":
+            break
+        time.sleep(1.5)
+    else:
+        return True                          # nothing moves either way: the list fits one screen
+    edge = 0 if direction == "up" else -1    # the first chat at the top / the last at the bottom
+    for _ in range(6):                       # come back; the same end again = the real end
+        res, back = scroll_list(adb, direction, rows=2)
+        if res == "still":
+            return bool(back) and bool(view) and back[edge] == view[edge]
+    return False
+
+
+def show_all_chats(adb):
+    """Tap the 'All' filter tab (by id, any language) so a left-on Unread/Groups/... tab can't hide
+    chats. Harmless when All is already selected. Returns True if the tab was there."""
+    chip = core.find_node(_nodes(adb), ALL_FILTER_ID, "exact")
+    if chip:
+        adb.tap(*core.node_center(chip)); time.sleep(0.8)
+    return chip is not None
+
+
+def in_archived(adb):
+    """True when the Archived chats list is showing (its own activity / no main search bar)."""
+    line = foreground_focus(adb)
+    if line:
+        return "archived" in line
+    nodes = _nodes(adb)
+    return bool(_chat_rows(nodes)) and core.find_node(nodes, LIST_IDS[0], "exact") is None
+
+
+def open_archived(adb, stop=None):
+    """From the main chat list: go to its top and open 'Archived'. False if there is none."""
+    if in_archived(adb):
+        return True
+    scroll_to_end(adb, "up", stop=stop)
+    row = _settled_node(adb, lambda ns: core.find_node(ns, ARCHIVED_ID, "exact"))
+    if row is None:
+        return False
+    adb.tap(*core.node_center(row)); time.sleep(1.5)
+    return in_archived(adb)
+
+
+def leave_archived(adb):
+    for _ in range(3):
+        if not in_archived(adb):
+            return True
+        adb.key("BACK"); time.sleep(1.2)
+    return not in_archived(adb)
+
+
 def keep_awake(adb, on=True):
     """Prevent the screen from locking/sleeping mid-run. `svc power stayon` only holds while the
     device thinks it's charging and resets whenever USB briefly drops, so we ALSO push the
@@ -491,58 +695,55 @@ def wake_unlock(adb, size=None):
 
 # ----------------------------------------------------------------- scan
 def scan_chats(adb, size, emit=None, max_scrolls=500, pause=None, stop=None):
-    """Scroll from the top and return the ordered list of chat names.
-    Uses a gentle, momentum-free swipe (no fling -> no skipped names) and treats the bottom as
-    'the list stopped moving' (not 'no new names', which fires early on long lists).
+    """Every chat name, in order: the main chat list from its very top, then the Archived chats.
+    Uses the shared verified scroller (no chat skipped on any screen) and the All filter tab.
     Pausable via `pause` (set = paused) and stoppable via `stop` (threading.Events)."""
-    w, h = size
-    cx, cy = w // 2, h // 2
-    off = int(h * 0.06)                   # same tiny swing as the export scroll (no fling)
-
     def _wait_pause():
         while pause is not None and pause.is_set():
             if stop is not None and stop.is_set():
                 return
             time.sleep(0.2)
 
-    def swipe_up():                       # gentle, toward the top
-        adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
-
-    def swipe_down():                     # gentle, toward the bottom
-        adb.swipe(cx, cy + off, cx, cy - off, 1200); time.sleep(0.7)
-
     keep_awake(adb, True)
-    # jump to the top first (stop when the view stops changing)
-    last = None
-    for _ in range(40):
-        if stop and stop.is_set():
-            return []
-        _wait_pause()
-        cur = [nm for _, nm in visible_chats(adb)]
-        if cur and cur == last:
-            break
-        last = cur; swipe_up()
-
     ordered, seen = [], set()
-    stale = 0
-    for _ in range(max_scrolls):
-        if stop and stop.is_set():
-            break
-        _wait_pause()
-        before = [nm for _, nm in visible_chats(adb)]
-        for nm in before:
+
+    def collect(names):
+        for nm in names:
             if nm not in seen:
                 seen.add(nm); ordered.append(nm)
         if emit:
             emit("scan_progress", len(ordered))
-        swipe_down()
-        after = [nm for _, nm in visible_chats(adb)]
-        if after and after == before:        # the list did not move -> bottom reached
-            stale += 1
-            if stale >= 3:
+
+    leave_archived(adb)
+    for section in ("chats", "archived"):
+        if stop is not None and stop.is_set():
+            break
+        if section == "archived":
+            if not open_archived(adb, stop=stop):
                 break
-        else:
-            stale = 0
+        scroll_to_end(adb, "up", stop=stop)
+        if section == "chats":
+            show_all_chats(adb)
+        collect([nm for _, nm in visible_chats(adb)])
+        stills = 0
+        for _ in range(max_scrolls):
+            if stop is not None and stop.is_set():
+                break
+            _wait_pause()
+            res, view = scroll_list(adb, "down")
+            collect(view)
+            if res == "moved":
+                stills = 0
+                continue
+            if res == "unreadable":
+                time.sleep(1.0)
+                continue
+            stills += 1
+            if stills >= 2:
+                if _end_confirmed(adb, "down", "up", view, stop):
+                    break
+                stills = 0
+    leave_archived(adb)
     return ordered
 
 
@@ -601,6 +802,30 @@ def _wait_node(adb, text, timeout=30, match="contains", stop=None):
         if stop is not None and stop.is_set():
             return None
         n = core.find_node(_nodes(adb), text, match)
+        if n:
+            return n
+        time.sleep(1.0)
+    return None
+
+
+SHARE_TARGETS = ("Quick Share", "Nearby Share")   # Google renamed Nearby Share in 2024; older
+#                                                  phones and older Play services still show it
+
+
+def _share_target(nodes):
+    for label in SHARE_TARGETS:
+        n = core.find_node(nodes, label, "contains")
+        if n:
+            return n
+    return None
+
+
+def _wait_share_target(adb, timeout=30, stop=None):
+    end = time.time() + timeout
+    while time.time() < end:
+        if stop is not None and stop.is_set():
+            return None
+        n = _share_target(_nodes(adb))
         if n:
             return n
         time.sleep(1.0)
@@ -680,7 +905,7 @@ def _wait_export_outcome(adb, timeout, stop=None):
             return "blocked"
         if core.find_node(nodes, "Unable to export", "contains") or _notice_dialog(nodes):
             return "unable"                # (a one-button notice after the media choice, any language)
-        if core.find_node(nodes, "Quick Share", "contains"):
+        if _share_target(nodes):
             return "qs"
         if on_share_sheet(adb):            # chooser up but unreadable -> export reached the share sheet
             return "qs"
@@ -983,12 +1208,15 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # a readable node to learn its position (and the chooser is only *sometimes* unreadable, so a
     # longer wait can catch a readable moment on the first run of a new device).
     if not (on_share_sheet(adb) and cached.get("qs")):
-        qs_node = _wait_node(adb, "Quick Share",
-                             max(2, min(40 if cached.get("qs") else 240, _left())), stop=outer_stop)
+        qs_node = _wait_share_target(adb, max(2, min(40 if cached.get("qs") else 240, _left())),
+                                     stop=outer_stop)
     before = bt.snapshot(save_dir)
     if auto_accept and qs_accept is not None:
-        threading.Thread(target=lambda: qs_accept.accept_quickshare(timeout=180, log=emit_log),
-                         daemon=True).start()
+        if accept_watcher is not None:
+            accept_watcher.arm(180)            # the run's one watcher (no new thread per chat)
+        else:
+            threading.Thread(target=lambda: qs_accept.accept_quickshare(timeout=180, log=emit_log),
+                             daemon=True).start()
     if qs_node is not None:
         _COORDS.setdefault(key, {})["qs"] = list(core.node_center(qs_node)); _save_coords()
         adb.tap(*core.node_center(qs_node)); time.sleep(2.0)  # picker then polls (_wait_pc_node)
@@ -1103,6 +1331,8 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         if time.time() < floor_until:
             continue                                   # can't see progress yet -> honour the floor
         break                                          # no file, no progress -> genuinely done/failed
+    if accept_watcher is not None:
+        accept_watcher.disarm()                # transfer over: never accept someone else's file
     if not res:
         # LAST-CHANCE catch: the file may have landed right at the wait boundary (or while we were
         # navigating). Grab a new, stable, VALID zip from the folder before declaring failure - so a
@@ -1140,10 +1370,7 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
              f"{info['media_bytes']/1e6:.1f} MB media ({label})")
     if label != media["mode"]:
         emit_log(f"note: UI flow attempted '{media['mode']}' but the file is '{label}'")
-    try:
-        case.record_file(Path(path), f"whatsapp export ({label}) via Quick Share")
-    except Exception:
-        pass
+    _record_export(case, path, digest, label, emit_log)
     emit_log(f"received {Path(path).name} ({nbytes} bytes, {label})")
     return "ok", path, digest, label
 
@@ -1245,6 +1472,41 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
 
 
 
+def keep_in_case(case, path, digest, note):
+    """Copy a received export into <case>/exports/ so the whole session is in ONE folder, verify the
+    copy has the received file's SHA-256, and log it in hashes.csv. An earlier export of the same
+    chat is never overwritten. Returns the copy's path, or None if the copy didn't verify."""
+    src = Path(path)
+    dest_dir = Path(case.dir) / "exports"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest, n = dest_dir / src.name, 1
+    while dest.exists():
+        dest = dest_dir / f"{src.stem} ({n}){src.suffix}"
+        n += 1
+    shutil.copy2(src, dest)
+    if core.sha256_file(dest) != digest:
+        dest.unlink()
+        return None
+    case.record_file(dest, f"{note} (copy of {src})")
+    return dest
+
+
+def _record_export(case, path, digest, label, emit_log):
+    """Chain of custody for a received export: hash the received file where Quick Share saved it,
+    and keep a verified copy in the case folder."""
+    note = f"whatsapp export ({label}) via Quick Share"
+    try:
+        case.record_file(Path(path), note)
+    except Exception as e:
+        emit_log(f"WARNING: could not record {Path(path).name} in the case log ({e})")
+    try:
+        if keep_in_case(case, path, digest, note) is None:
+            emit_log(f"WARNING: the copy of {Path(path).name} in the case folder did not match its "
+                     "hash - not kept (the received file is unchanged)")
+    except Exception as e:
+        emit_log(f"WARNING: could not copy {Path(path).name} into the case folder ({e})")
+
+
 def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
                       pc_name, save_dir, ensure_list, pause=None):
     """Run export_and_send, retrying the whole thing on a transient Quick Share failure
@@ -1289,10 +1551,7 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
             except Exception:
                 pass
             emit_log(f"received {Path(lp).name} ({lb} bytes, {label}) - arrived late; NOT re-sending (no duplicate)")
-            try:
-                case.record_file(Path(lp), f"whatsapp export ({label}) via Quick Share")
-            except Exception:
-                pass
+            _record_export(case, lp, ld, label, emit_log)
             return "ok", lp, ld, label
         emit_log(f"{status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
         ensure_list()
@@ -1526,7 +1785,8 @@ def _csv_unsafe(s):
     return s
 
 
-CSV_HEADER = ["#", "chat", "status", "media", "saved_file", "sha256", "time"]
+CSV_HEADER = ["#", "chat", "status", "media", "saved_file", "sha256", "time", "list"]
+_SECTION_NAMES = {"chats": "chat list", "archived": "Archived chats"}
 
 
 _CSV_FALLBACK = {}        # target csv -> side file used while the target is locked (this run)
@@ -1593,6 +1853,16 @@ def write_csv_atomic(path, rows, log=lambda m: None):
                 os.remove(path + ".tmp")
         except Exception:
             pass
+
+
+def plan_csv(case_dir, cases_dir, serial, package=None, picked=None):
+    """(resume_from, csv_path) for a run. Progress is ALWAYS written into the current case folder,
+    so one session's CSV, contacts, exports and hashes stay together. A CSV picked by the examiner,
+    or this device's newest earlier one, is only READ (its chats already ok are skipped) and left
+    untouched as the earlier session's evidence."""
+    out = Path(case_dir) / csv_name(package)
+    resume = picked or latest_csv_for_serial(cases_dir, serial, package)
+    return (str(resume) if resume else None), str(out)
 
 
 def latest_csv_for_serial(cases_dir, serial, package=None):
@@ -1684,6 +1954,7 @@ class RollingBatch(threading.Thread):
         self.scan_order = None           # a pre-scanned ordered list of names (for directional seek)
         self._done_fps = set()           # fingerprints of finished chats (loop/duplicate guard)
         self._dup_warned = set()         # names already flagged as ambiguous duplicates (F-10)
+        self.section_of = {}             # chat name -> 'chats' (main list) or 'archived'
 
     def stop(self):
         self._stop.set()
@@ -1768,24 +2039,10 @@ class RollingBatch(threading.Thread):
         return False
 
     def _swipe_down(self):
-        # Drag symmetrically about the EXACT centre (cx, cy+off -> cy-off), staying in the middle
-        # band so it never hits the bottom "home" gesture area (which would close WhatsApp).
-        # A SHORT swing over a SLOW stroke = a controlled drag with no fling momentum, so the list
-        # advances only a little each time and keeps a big overlap between pages -> no chat is
-        # skipped. (A faster/longer swipe flings past rows and was missing chats.)
-        w, h = self.size                       # screen size, read from the device on connect
-        cx, cy = w // 2, h // 2                # exact centre point
-        # Tiny swing over a VERY slow stroke so the release velocity is far below Android's fling
-        # threshold -> the list moves exactly the drag distance with NO momentum/overshoot, so no
-        # chat is flung past unread. (0.06h over 1200ms: measured ratio ~1.0 = no overshoot.)
-        off = int(h * 0.06)
-        self.adb.swipe(cx, cy + off, cx, cy - off, 1200); time.sleep(0.7)
+        scroll_list(self.adb, "down")          # one verified page (see scroll_list)
 
     def _swipe_up(self):
-        w, h = self.size
-        cx, cy = w // 2, h // 2
-        off = int(h * 0.06)
-        self.adb.swipe(cx, cy - off, cx, cy + off, 1200); time.sleep(0.7)
+        scroll_list(self.adb, "up")
 
     def _seek_chat(self, target, max_scrolls=200):
         """Navigate to `target` and begin there. If a pre-scanned order is known, use it to decide
@@ -1852,6 +2109,219 @@ class RollingBatch(threading.Thread):
                 self._swipe_down()             # target is within range but just off-screen
         return False
 
+    # ------------------------------------------------------------- walking the lists
+    def _wanted(self, nm):
+        """Is `nm` one of the chats this run should export? (all, or only the chosen ones)"""
+        if self.only_names is None:
+            return True
+        keys = {_norm_name(n).lower() for n in self.only_names}
+        return _norm_name(nm).lower() in keys
+
+    def _targets_done(self):
+        """With a chosen set of chats: True once every one of them has a final status."""
+        if not self.only_names:
+            return False
+        keys = {_norm_name(n).lower() for n in self.only_names}
+        done = {_norm_name(n).lower() for n, s in self.status.items() if s not in ("pending", "running")}
+        return keys <= done
+
+    def _enter_section(self, section):
+        """Show the main chat list ('chats') or the Archived list, with the All filter on."""
+        self._ensure_list()
+        if section == "archived":
+            return open_archived(self.adb, stop=self._stop)
+        leave_archived(self.adb)
+        show_all_chats(self.adb)
+        return True
+
+    def _in_section(self, section):
+        return in_archived(self.adb) == (section == "archived")
+
+    def _walk(self, section, from_top=True, retry=None):
+        """Export every pending chat of one list, top to bottom. `retry` = a set of chat names to
+        export again (the end-of-run sweep); otherwise every newly seen chat is queued.
+        Returns the number of chats exported OK."""
+        exported = 0
+        unexpected = 0                             # non-AdbError errors (safety bail at 30)
+        try:
+            if not self._enter_section(section):
+                return 0
+            if from_top:
+                scroll_to_end(self.adb, "up", stop=self._stop)
+        except Exception as e:                     # never let one bad read end the evidence run
+            unexpected += 1
+            self.emit("log", f"unexpected error (continuing, {unexpected}/30): {e!r}")
+        stills = 0
+        unreadable = 0        # consecutive pages with no readable chat rows
+        clip_waits = 0        # nudges spent bringing a clipped (half-visible) chat fully on screen
+        loops = 0
+        while not self._stop.is_set() and loops < 20000:
+            loops += 1
+            self._wait_pause()
+            if self._stop.is_set():
+                break
+            if not self._device_ready():
+                self.emit("log", "device disconnected - waiting up to 180s")
+                if not self._wait_device():
+                    break
+                time.sleep(1)
+                keep_awake(self.adb, True); wake_unlock(self.adb, self.size)   # re-arm after reconnect
+                self._ensure_list()
+            if loops % 15 == 0:
+                keep_awake(self.adb, True)       # periodically re-assert (stay-on can lapse)
+            try:
+                # if WhatsApp threw an "isn't responding" (ANR) dialog, tap WAIT and carry on
+                if dismiss_anr(self.adb):
+                    self.emit("log", "handled a 'WhatsApp isn't responding' dialog (tapped Wait)")
+                    time.sleep(1.5)
+                # a mega-chat's export can finish LATE and pop the Android share sheet after we
+                # already moved on; it's unreadable, so detect it by its foreground window.
+                for _ in range(4):
+                    if not on_share_sheet(self.adb):
+                        break
+                    self.adb.key("BACK"); time.sleep(1.0)
+                rows = _chat_rows(_nodes(self.adb))
+                if not rows:
+                    # unreadable -> often a LOCKED / screen-OFF phone: wake it and WAIT for an unlock
+                    unreadable += 1
+                    if unreadable > 30 or not self._recover_screen():
+                        self.emit("log", "chat list unreadable / could not recover - stopping")
+                        break
+                    continue
+                unreadable = 0
+                if not self._in_section(section):
+                    # a relaunch (last-resort recovery) lands on the main list: go back to this list
+                    if not self._enter_section(section):
+                        break
+                    scroll_to_end(self.adb, "up", stop=self._stop)
+                    continue
+                visible = [r["name"] for r in rows]
+                if retry is None:
+                    self._register(visible, section)
+                self._write_csv()
+                want = retry if retry is not None else None
+                pend = [r for r in rows if self.status.get(r["name"]) == "pending"
+                        and (want is None or r["name"] in want)]
+                todo = [r["name"] for r in pend if r["full"]]
+                if pend and not todo:
+                    # only TAP chats fully on screen (a clipped row can put the tap on the nav bar)
+                    clip_waits += 1
+                    if clip_waits <= 2:
+                        y = core.node_center(pend[0]["node"])[1]
+                        scroll_list(self.adb, "up" if y < self.size[1] // 2 else "down", rows=1)
+                        continue
+                    todo = [pend[0]["name"]]           # fallback: never get stuck on it
+                if todo:
+                    stills = 0
+                    clip_waits = 0
+                    name = todo[0]
+                    self._last_running = name
+                    self.emit("row", name, "running")
+                    st = self._export_one(name)
+                    self.status[name] = st
+                    self.section_of.setdefault(name, section)
+                    fp = _fingerprint(name)
+                    if fp:
+                        self._done_fps.add(fp)               # finished -> never re-export a variant
+                    self.emit("row", name, st)
+                    if st == "ok":
+                        exported += 1
+                    self._write_csv()
+                    continue
+                if self._targets_done() or (retry is not None and not any(
+                        self.status.get(n) == "pending" for n in retry)):
+                    break                                    # everything asked for is done
+                res, view = scroll_list(self.adb, "down")
+                if res == "unreadable":
+                    if not self._recover_screen():
+                        self.emit("log", "chat list unreadable / could not recover - stopping")
+                        break
+                    continue
+                if res == "moved":
+                    stills = 0
+                    continue
+                stills += 1
+                if stills >= 2:
+                    if _end_confirmed(self.adb, "down", "up", view, self._stop):
+                        self.emit("log", f"reached the bottom of the {_SECTION_NAMES[section]}")
+                        break
+                    stills = 0
+            except core.AdbError as e:
+                self.emit("log", f"adb error (likely disconnect): {e}")
+                self._wait_device()
+                try:
+                    self._ensure_list()
+                except core.AdbError:
+                    pass
+            except Exception as e:
+                # a single unexpected error on one chat must NEVER kill the whole evidence run
+                unexpected += 1
+                self.emit("log", f"unexpected error (continuing, {unexpected}/30): {e!r}")
+                if unexpected >= 30:
+                    self.emit("log", "too many unexpected errors - stopping (safety)")
+                    break
+                try:
+                    self._ensure_list()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+        return exported
+
+    def _register(self, visible, section):
+        """Queue newly seen chats (or mark them skipped when only some chats were chosen)."""
+        for nm in visible:
+            self.section_of.setdefault(nm, section)
+            if nm in self.status:
+                continue
+            # LOOP GUARD: a chat we already FINISHED read again with a slightly different name
+            # (happens under load) has the same fingerprint -> skip it as a duplicate.
+            # A "" fingerprint (an all-symbol/emoji name) is NEVER treated as a duplicate.
+            fp = _fingerprint(nm)
+            if fp and fp in self._done_fps:
+                self.status[nm] = "skipped"; self.order.append(nm)
+                self.emit("discover", nm); self.emit("row", nm, "skipped")
+                self.emit("log", f"duplicate of a finished chat - skipping: {nm!r}")
+                continue
+            sel = self._wanted(nm)
+            self.status[nm] = "pending" if sel else "skipped"
+            self.order.append(nm)
+            self.emit("discover", nm)
+            if not sel:
+                self.emit("row", nm, "skipped")
+        # F-10: two chats with the SAME display name are tracked as one (status is keyed by name):
+        # surface it so the operator renames one, instead of a silently-incomplete CSV.
+        for dup in duplicate_names(visible):
+            if dup not in self._dup_warned:
+                self._dup_warned.add(dup)
+                self.emit("log", f"WARNING ambiguous-duplicate: {dup!r} appears more than "
+                          "once on screen; only one is tracked - rename one on the phone "
+                          "to export both")
+
+    def _retry_failed(self):
+        """End-of-run sweep: every chat that still failed (transfer, picker, export, not found...)
+        gets one more full attempt, in the list it lives in. Privacy-blocked chats can't be exported
+        and are not retried. Returns the number recovered."""
+        failed = [n for n, s in self.status.items() if s.startswith("fail")]
+        if not failed or self._stop.is_set():
+            return 0
+        self.emit("log", f"retrying {len(failed)} chat(s) that failed earlier: "
+                         + ", ".join(repr(n) for n in failed[:10]) + (" ..." if len(failed) > 10 else ""))
+        before = {n: self.status[n] for n in failed}
+        for n in failed:
+            self.status[n] = "pending"
+            self.emit("row", n, "pending")
+        got = 0
+        for section in ("chats", "archived"):
+            names = {n for n in failed if self.section_of.get(n, "chats") == section}
+            if names and not self._stop.is_set():
+                got += self._walk(section, from_top=True, retry=names)
+        for n in failed:                          # not reached again -> keep its real failure
+            if self.status.get(n) in ("pending", "running"):
+                self.status[n] = before[n]
+                self.emit("row", n, before[n])
+        self._write_csv()
+        return got
+
     def _write_csv(self):
         now = core.now_iso()
         rows = []
@@ -1862,15 +2332,26 @@ class RollingBatch(threading.Thread):
             fn, digest, media = self.files.get(nm, ("", "", ""))
             if not media and st.startswith("fail"):
                 media = "not exported"       # chat never opened -> no media choice made
-            rows.append([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times.get(nm, "")])
+            rows.append([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times.get(nm, ""),
+                         self.section_of.get(nm, "")])
         write_csv_atomic(self.csv_path, rows, lambda m: self.emit("log", m))
 
     def _export_one(self, name):
         def reopen():
-            node = _find_chat_node(self.adb, name)
+            key = _norm_name(name).lower()
+
+            def find(nodes):
+                hits = [r for r in _chat_rows(nodes) if r["name"].lower() == key]
+                hits.sort(key=lambda r: not r["full"])          # full rows first
+                return hits[0]["node"] if hits else None
+            node = _settled_node(self.adb, find)
             if not node:
                 return False
             self.adb.tap(*core.node_center(node)); time.sleep(1.4)
+            if opened_chat_matches(_nodes(self.adb), name) is False:
+                self.emit("log", f"   opened a different chat than {name!r} - going back (not exported)")
+                _back_to_list(self.adb)
+                return False
             return True
         status, path, digest, media = export_with_retry(
             self.adb, self.case, self.size, reopen,
@@ -1889,7 +2370,6 @@ class RollingBatch(threading.Thread):
 
     def run(self):
         exported = 0
-        unexpected = 0                             # count of non-AdbError errors (safety bail at 30)
         try:
             if not self._device_ready() and not self._wait_device():
                 self.emit("finished", {"exported": 0, "total": 0, "csv": self.csv_path}); return
@@ -1900,6 +2380,9 @@ class RollingBatch(threading.Thread):
                 self._orig_sot = None
             keep_awake(self.adb, True)
             pc_keep_awake(True)                   # keep THIS PC awake for the whole run (like the phone)
+            global accept_watcher
+            if qs_accept is not None:
+                accept_watcher = qs_accept.AcceptWatcher(log=lambda m: self.emit("log", f"   {m}"))
             self.emit("log", "PC sleep/screen-off suppressed for the duration of the run")
             if not Path(self.save_dir).is_dir():
                 self.emit("log", f"WARNING: save folder '{self.save_dir}' does not exist - "
@@ -1928,6 +2411,9 @@ class RollingBatch(threading.Thread):
                     if nm not in self.order:
                         self.order.append(nm)
                     self.status[nm] = "ok" if st.get(nm) == "ok" else "pending"
+                    if self.status[nm] == "ok" and self.only_names and self._wanted(nm):
+                        self.status[nm] = "pending"     # explicitly chosen -> export it again
+                        self.emit("log", f"resume: {nm!r} was already ok - exporting again (chosen)")
                     self.files[nm] = fl.get(nm, ("", "", ""))
                     self.times[nm] = tm.get(nm, "")
                     if self.status[nm] == "ok":
@@ -1953,151 +2439,21 @@ class RollingBatch(threading.Thread):
                     self.emit("log", f"'{self.start_from}' not found - starting from the top")
 
             self.emit("log", f"rolling export started - CSV: {self.csv_path}")
-            stale = 0
-            no_new = 0            # consecutive swipes that moved but revealed nothing new
-            clip_waits = 0        # nudges spent bringing a clipped (half-visible) chat fully on screen
-            loops = 0
-            while not self._stop.is_set():
-                self._wait_pause()
-                if self._stop.is_set():
-                    break
-                if not self._device_ready():
-                    self.emit("log", "device disconnected - waiting up to 180s")
-                    if not self._wait_device():
-                        break
-                    time.sleep(1)
-                    keep_awake(self.adb, True); wake_unlock(self.adb, self.size)   # re-arm after reconnect
-                    self._ensure_list()
-                loops += 1
-                if loops % 15 == 0:
-                    keep_awake(self.adb, True)       # periodically re-assert (stay-on can lapse)
-                try:
-                    # if WhatsApp threw an "isn't responding" (ANR) dialog, tap WAIT and carry on
-                    # instead of stalling behind it.
-                    if dismiss_anr(self.adb):
-                        self.emit("log", "handled a 'WhatsApp isn't responding' dialog (tapped Wait)")
-                        time.sleep(1.5)
-                    # a mega-chat's export can finish LATE and pop the Android share sheet after we
-                    # already moved on; it's unreadable so visible_chats can't see it. Detect the
-                    # chooser by its foreground window and BACK out of it before doing anything.
-                    for _ in range(4):
-                        if not on_share_sheet(self.adb):
-                            break
-                        self.adb.key("BACK"); time.sleep(1.0)
-                    visible = [nm for _, nm in visible_chats(self.adb)]
-                    if not visible:
-                        # unreadable at the top of the loop -> often a LOCKED / screen-OFF phone.
-                        # Wake it, and WAIT for the user to unlock a secure lock, before deciding.
-                        if not self._recover_screen():
-                            self.emit("log", "chat list unreadable / could not recover - stopping")
-                            break
-                        visible = [nm for _, nm in visible_chats(self.adb)]
-                    for nm in visible:
-                        if nm not in self.status:
-                            # LOOP GUARD: if a chat we already FINISHED is read again with a slightly
-                            # different name (happens under load), its fingerprint matches -> skip it
-                            # as a duplicate instead of exporting it again. A "" fingerprint (an
-                            # all-symbol/emoji name) is NEVER treated as a duplicate.
-                            fp = _fingerprint(nm)
-                            if fp and fp in self._done_fps:
-                                self.status[nm] = "skipped"; self.order.append(nm)
-                                self.emit("discover", nm); self.emit("row", nm, "skipped")
-                                self.emit("log", f"duplicate of a finished chat - skipping: {nm!r}")
-                                continue
-                            # export only the selected chats when a whitelist is set; skip the rest
-                            sel = self.only_names is None or nm in self.only_names
-                            self.status[nm] = "pending" if sel else "skipped"
-                            self.order.append(nm)
-                            self.emit("discover", nm)
-                            if not sel:
-                                self.emit("row", nm, "skipped")
-                    # F-10: two chats with the SAME display name are tracked as one (status is keyed
-                    # by name). We cannot fully disambiguate without a durable per-chat id, so SURFACE
-                    # it: if the same name is on screen more than once, warn (once) so the operator
-                    # renames one - instead of a silently-incomplete CSV.
-                    for dup in duplicate_names(visible):
-                        if dup not in self._dup_warned:
-                            self._dup_warned.add(dup)
-                            self.emit("log", f"WARNING ambiguous-duplicate: {dup!r} appears more than "
-                                      "once on screen; only one is tracked - rename one on the phone "
-                                      "to export both")
-                    self._write_csv()
-                    # only TAP chats that are fully on screen: a row clipped at the top/bottom edge
-                    # can put the tap on the navigation bar. If the next pending chat is clipped,
-                    # nudge the list toward it first (max 2 nudges, then tap it anyway).
-                    rows = _chat_rows(_nodes(self.adb))
-                    pend = [r for r in rows if self.status.get(r["name"]) == "pending"]
-                    todo = [r["name"] for r in pend if r["full"]]
-                    if pend and not todo:
-                        clip_waits += 1
-                        if clip_waits <= 2:
-                            y = core.node_center(pend[0]["node"])[1]
-                            (self._swipe_up if y < self.size[1] // 2 else self._swipe_down)()
-                            continue
-                        todo = [pend[0]["name"]]           # fallback: never get stuck on it
-                    if todo:
-                        stale = 0
-                        clip_waits = 0
-                        name = todo[0]
-                        self._last_running = name
-                        self.emit("row", name, "running")
-                        st = self._export_one(name)
-                        self.status[name] = st
-                        fp = _fingerprint(name)
-                        if fp:
-                            self._done_fps.add(fp)               # finished -> never re-export a variant
-                        self.emit("row", name, st)
-                        if st == "ok":
-                            exported += 1
-                        self._write_csv()
-                        continue
-                    # whole page done -> scroll for more
-                    before_swipe = visible
-                    self._swipe_down()
-                    after = [nm for _, nm in visible_chats(self.adb)]
-                    if not after:                      # empty read -> wake/unlock and retry (not bottom)
-                        if self._recover_screen():
-                            continue
-                        self.emit("log", "chat list unreadable / could not recover - stopping")
-                        break
-                    if any(nm not in self.status for nm in after):
-                        stale = 0; no_new = 0          # found new chats -> keep going
-                    elif after == before_swipe:
-                        # the list did NOT move at all -> genuinely the bottom (only reliable signal)
-                        stale += 1
-                        if stale >= 3:
-                            self.emit("log", "reached the bottom of the chat list")
-                            break
-                    else:
-                        # list MOVED but revealed nothing new: we're re-traversing already-seen
-                        # chats (e.g. the list jumped to the top after a relaunch). This is NOT the
-                        # bottom - keep scrolling. Only an extremely long dry spell is a safety stop.
-                        stale = 0
-                        no_new += 1
-                        if no_new >= 150:
-                            self.emit("log", "no new chats after 150 scrolls - stopping (safety)")
-                            break
-                except core.AdbError as e:
-                    self.emit("log", f"adb error (likely disconnect): {e}")
-                    self._wait_device()
-                    try:
-                        self._ensure_list()
-                    except core.AdbError:
-                        pass
-                except Exception as e:
-                    # a single unexpected error on one chat must NEVER kill the whole evidence run:
-                    # log it, try to get back to the list, and carry on. Bail only if they pile up.
-                    unexpected += 1
-                    self.emit("log", f"unexpected error (continuing, {unexpected}/30): {e!r}")
-                    if unexpected >= 30:
-                        self.emit("log", "too many unexpected errors - stopping (safety)")
-                        break
-                    try:
-                        self._ensure_list()
-                    except Exception:
-                        pass
-                    time.sleep(1.0)
+            # main list from the top (a START-FROM seek already placed us: walk on from there),
+            # then the Archived chats, then one more attempt for anything that failed.
+            exported += self._walk("chats", from_top=not self.start_from)
+            if not self._stop.is_set() and not self._targets_done():
+                if open_archived(self.adb, stop=self._stop):
+                    self.emit("log", "now exporting the Archived chats")
+                    exported += self._walk("archived", from_top=True)
+                else:
+                    self.emit("log", "no Archived chats")
+            exported += self._retry_failed()
+            leave_archived(self.adb)
         finally:
+            if accept_watcher is not None:
+                accept_watcher.stop()
+                accept_watcher = None
             pc_keep_awake(False)                  # release the PC sleep/display lock
             keep_awake(self.adb, False)
             try:                                  # restore the phone's original screen-off timeout

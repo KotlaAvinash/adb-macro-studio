@@ -73,6 +73,74 @@ DEBUG_LOG = LOG_DIR / "gui_session.log"
 BATCH_LOG = LOG_DIR / "batch_session.log"
 CANVAS_W, CANVAS_H = 290, 500
 LIVE_INTERVAL_MS = 800
+LIVE_BUSY_MS = 6000      # live view during a run: a full-resolution screenshot every 6 s, not 2.4 s -
+#                          screenshots compete with the run's screen reads and heat a long run's phone
+LOG_MAX_LINES = 3000     # on-screen log only (the log FILES keep everything): an unbounded text box
+#                          slowed the window down over a long run
+
+
+ACCENT = "#128c7e"            # WhatsApp teal
+ACCENT_DARK = "#0b6b60"
+BG = "#f4f6f8"
+
+
+def apply_theme(root):
+    """A clean, consistent look on every window (plain ttk, no extra packages)."""
+    st = ttk.Style(root)
+    try:
+        st.theme_use("clam")
+    except tk.TclError:
+        return
+    base = ("Segoe UI", 10)
+    for cls in ("Text", "Listbox", "Entry"):          # plain tk widgets (ttk ones use the styles)
+        root.option_add(f"*{cls}.Font", base)
+    root.configure(background=BG)
+    st.configure(".", background=BG, font=base)
+    st.configure("TFrame", background=BG)
+    st.configure("TLabel", background=BG, foreground="#1f2328")
+    st.configure("Header.TLabel", font=("Segoe UI Semibold", 15), foreground="#0f172a")
+    st.configure("Sub.TLabel", foreground="#5f6b7a")
+    st.configure("TButton", padding=(10, 5), background="#ffffff", bordercolor="#d0d7de")
+    st.map("TButton", background=[("active", "#eef2f6")])
+    st.configure("Accent.TButton", padding=(14, 7), background=ACCENT, foreground="#ffffff",
+                 bordercolor=ACCENT_DARK, font=("Segoe UI Semibold", 10))
+    st.map("Accent.TButton", background=[("active", ACCENT_DARK), ("disabled", "#9bbfb9")])
+    st.configure("Danger.TButton", foreground="#b42318")
+    st.configure("Card.TLabelframe", background=BG, bordercolor="#d0d7de")
+    st.configure("Card.TLabelframe.Label", background=BG, foreground="#334155",
+                 font=("Segoe UI Semibold", 10))
+    st.configure("TLabelframe", background=BG, bordercolor="#d0d7de")
+    st.configure("TLabelframe.Label", background=BG, foreground="#334155", font=("Segoe UI Semibold", 10))
+    st.configure("Treeview", rowheight=26, background="#ffffff", fieldbackground="#ffffff",
+                 bordercolor="#d0d7de")
+    st.configure("Treeview.Heading", font=("Segoe UI Semibold", 10), background="#e9eef3")
+    st.map("Treeview", background=[("selected", "#cfe8e4")], foreground=[("selected", "#0f172a")])
+    st.configure("TCheckbutton", background=BG)
+    st.configure("TRadiobutton", background=BG)
+
+
+def _px(widget, n):
+    """`n` design pixels (at 100% display scaling) in real pixels on this display."""
+    try:
+        return int(n * widget.winfo_fpixels("1i") / 96.0)
+    except Exception:
+        return n
+
+
+def _fit(widget, w, h):
+    """A geometry of w x h design pixels, scaled to the display and kept inside the screen."""
+    sw, sh = widget.winfo_screenwidth(), widget.winfo_screenheight()
+    return f"{min(_px(widget, w), sw - 40)}x{min(_px(widget, h), sh - 110)}"
+
+
+def _append_capped(widget, line):
+    widget.config(state="normal")
+    widget.insert("end", line + "\n")
+    extra = int(widget.index("end-1c").split(".")[0]) - LOG_MAX_LINES
+    if extra > 0:
+        widget.delete("1.0", f"{extra + 1}.0")
+    widget.see("end")
+    widget.config(state="disabled")
 
 
 # ------------------------------------------------------------------ step dialog
@@ -346,14 +414,16 @@ class SequenceDialog(tk.Toplevel):
 class BatchExportWindow(tk.Toplevel):
     """Scan the WhatsApp chat list, pick chats, export them one by one with live progress."""
 
-    STATUS_TAGS = {"ok": "#0a0", "running": "#06c", "pending": "#888",
-                   "skipped": "#888", "blocked-privacy": "#c80"}
+    STATUS_TAGS = {"ok": "#1b873f", "running": "#1565c0", "pending": "#7a7f87",
+                   "skipped": "#9aa0a6", "blocked-privacy": "#b26a00"}
 
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
-        self.title("WhatsApp batch export")
-        self.geometry("580x640")
+        self.title("WhatsApp export")
+        self.geometry(_fit(self, 820, 800))
+        self.minsize(min(_px(self, 720), self.winfo_screenwidth() - 40),
+                     min(_px(self, 600), self.winfo_screenheight() - 110))
         self.q = _queue.Queue()
         self.order = []           # full scanned chat order (top -> bottom)
         self.row_of = {}          # chat name -> tree item id
@@ -363,77 +433,89 @@ class BatchExportWindow(tk.Toplevel):
         self._running_name = None               # chat currently being exported (for status display)
         self.scan_stop = threading.Event()
 
-        top = ttk.Frame(self, padding=6)
-        top.pack(fill="x")
-        self.scan_btn = ttk.Button(top, text="Scan chat list", command=self.scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(top, text="Select all", command=lambda: self.tree.selection_set(self.tree.get_children())).pack(side="left", padx=4)
-        ttk.Button(top, text="Auto: scan + export", command=self.rolling_start).pack(side="left", padx=4)
-        ttk.Button(top, text="Save list to CSV", command=self.save_csv).pack(side="left", padx=4)
-        self.status_lbl = ttk.Label(top, text="not scanned yet")
-        self.status_lbl.pack(side="left", padx=8)
+        head = ttk.Frame(self, padding=(12, 10, 12, 4))
+        head.pack(fill="x")
+        ttk.Label(head, text="WhatsApp export", style="Header.TLabel").pack(side="left")
+        self.status_lbl = ttk.Label(head, text="ready - open WhatsApp on its chat list",
+                                    style="Sub.TLabel")
+        self.status_lbl.pack(side="left", padx=12)
 
-        cfg = ttk.Frame(self, padding=(6, 0))
-        cfg.pack(fill="x")
-        ttk.Label(cfg, text="PC (Quick Share) name:").pack(side="left")
+        # the main action first: scan and export in one pass (a separate scan is optional)
+        acts = ttk.Frame(self, padding=(12, 4))
+        acts.pack(fill="x")
+        ttk.Button(acts, text="Scan + Export all chats", style="Accent.TButton",
+                   command=self.rolling_start).pack(side="left")
+        self.start_btn = ttk.Button(acts, text="Export selected", command=self.start)
+        self.start_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(acts, text="Export one chat...", command=self.export_one).pack(side="left", padx=(8, 0))
+        self.scan_btn = ttk.Button(acts, text="Scan only (list chats)", command=self.scan)
+        self.scan_btn.pack(side="right")
+        ttk.Button(acts, text="Select all",
+                   command=lambda: self.tree.selection_set(self.tree.get_children())).pack(side="right", padx=8)
+
+        cfg = ttk.LabelFrame(self, text="Settings", padding=(10, 6), style="Card.TLabelframe")
+        cfg.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(cfg, text="PC (Quick Share) name").grid(row=0, column=0, sticky="w")
         self.pc_var = tk.StringVar(value=wb.PC_NAME)
-        ttk.Entry(cfg, textvariable=self.pc_var, width=16).pack(side="left", padx=4)
-        ttk.Label(cfg, text="Save folder:").pack(side="left", padx=(10, 0))
-        self.dir_var = tk.StringVar(value=wb.SAVE_DIR)
-        ttk.Entry(cfg, textvariable=self.dir_var, width=26).pack(side="left", padx=4)
+        ttk.Entry(cfg, textvariable=self.pc_var, width=20).grid(row=0, column=1, sticky="w", padx=(6, 18))
+        ttk.Label(cfg, text="App").grid(row=0, column=2, sticky="w")
         # which WhatsApp to export (only the installed ones are offered)
-        ttk.Label(cfg, text="App:").pack(side="left", padx=(10, 0))
         apps = wb.installed_whatsapp(self.app.adb) if self.app.adb else []
         self._app_pkgs = {wb.WA_PACKAGES[pk]: pk for pk in (apps or ["com.whatsapp"])}
         self.app_var = tk.StringVar(value=next(iter(self._app_pkgs)))
         ttk.Combobox(cfg, textvariable=self.app_var, values=list(self._app_pkgs), state="readonly",
-                     width=18).pack(side="left", padx=4)
+                     width=18).grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Label(cfg, text="Quick Share save folder").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.dir_var = tk.StringVar(value=wb.SAVE_DIR)
+        ttk.Entry(cfg, textvariable=self.dir_var, width=58).grid(row=1, column=1, columnspan=3, sticky="we",
+                                                                 padx=6, pady=(6, 0))
+        cfg.columnconfigure(3, weight=1)
         wb.label_asker = self._ask_label     # 'Export chat' in a language not seen before
 
         # resume / start-from controls (recover after a lock/crash without redoing work)
-        cfg2 = ttk.Frame(self, padding=(6, 2))
-        cfg2.pack(fill="x")
-        ttk.Label(cfg2, text="Start from chat:").pack(side="left")
+        cfg2 = ttk.LabelFrame(self, text="Resume", padding=(10, 6), style="Card.TLabelframe")
+        cfg2.pack(fill="x", padx=12, pady=4)
+        ttk.Label(cfg2, text="Start from chat").pack(side="left")
         self.startfrom_var = tk.StringVar(value="")
-        ttk.Entry(cfg2, textvariable=self.startfrom_var, width=20).pack(side="left", padx=4)
-        ttk.Button(cfg2, text="Start from selected", command=self.start_from_selected).pack(side="left", padx=(4, 0))
+        ttk.Entry(cfg2, textvariable=self.startfrom_var, width=20).pack(side="left", padx=6)
+        ttk.Button(cfg2, text="Use selected", command=self.start_from_selected).pack(side="left")
         self.resume_path = None
-        ttk.Button(cfg2, text="Resume from CSV...", command=self._pick_resume).pack(side="left", padx=(12, 0))
-        self.resume_lbl = ttk.Label(cfg2, text="(off)", foreground="#8a8")
+        ttk.Button(cfg2, text="Continue from a CSV...", command=self._pick_resume).pack(side="left", padx=(14, 0))
+        self.resume_lbl = ttk.Label(cfg2, text="(automatic: this phone's last session)", style="Sub.TLabel")
         self.resume_lbl.pack(side="left", padx=6)
         ttk.Button(cfg2, text="clear", command=self._clear_resume).pack(side="left")
 
-        mid = ttk.Frame(self, padding=6)
+        mid = ttk.Frame(self, padding=(12, 6))
         mid.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(mid, columns=("chat", "status"), show="headings",
                                  selectmode="extended", height=14)
-        self.tree.heading("chat", text="Chat (open WhatsApp to its list, then Scan)")
+        self.tree.heading("chat", text="Chat")
         self.tree.heading("status", text="Status")
-        self.tree.column("chat", width=400)
-        self.tree.column("status", width=120, anchor="center")
+        self.tree.column("chat", width=470)
+        self.tree.column("status", width=150, anchor="center")
         self.tree.pack(side="left", fill="both", expand=True)
         tsb = ttk.Scrollbar(mid, command=self.tree.yview)
         tsb.pack(side="left", fill="y")
         self.tree.config(yscrollcommand=tsb.set)
         for st, col in self.STATUS_TAGS.items():
             self.tree.tag_configure(st, foreground=col)
-        self.tree.tag_configure("fail", foreground="#c00")
+        self.tree.tag_configure("fail", foreground="#c62828")
 
-        pf = ttk.Frame(self, padding=6)
+        pf = ttk.Frame(self, padding=(12, 4))
         pf.pack(fill="x")
-        self.progress_lbl = ttk.Label(pf, text="idle")
+        self.progress_lbl = ttk.Label(pf, text="idle", style="Sub.TLabel")
         self.progress_lbl.pack(side="left")
-        self.start_btn = ttk.Button(pf, text="Export selected", command=self.start)
-        self.start_btn.pack(side="right", padx=4)
-        self.resume_btn = ttk.Button(pf, text="Resume pending", command=self.resume_pending)
-        self.resume_btn.pack(side="right", padx=4)
+        ttk.Button(pf, text="Stop", style="Danger.TButton", command=self.stop).pack(side="right")
         self.pause_btn = ttk.Button(pf, text="Pause", command=self.toggle_pause)
-        self.pause_btn.pack(side="right", padx=4)
-        ttk.Button(pf, text="Stop", command=self.stop).pack(side="right")
+        self.pause_btn.pack(side="right", padx=6)
+        self.resume_btn = ttk.Button(pf, text="Retry pending / failed", command=self.resume_pending)
+        self.resume_btn.pack(side="right")
+        ttk.Button(pf, text="Save list to CSV...", command=self.save_csv).pack(side="right", padx=6)
 
-        lf = ttk.LabelFrame(self, text="Progress log", padding=4)
-        lf.pack(fill="both", expand=False)
-        self.log = tk.Text(lf, height=8, wrap="word")
+        lf = ttk.LabelFrame(self, text="Progress log", padding=4, style="Card.TLabelframe")
+        lf.pack(fill="both", expand=False, padx=12, pady=(4, 12))
+        self.log = tk.Text(lf, height=6, wrap="word", relief="flat", font=("Consolas", 9),
+                           background="#fbfbfc")
         self.log.pack(side="left", fill="both", expand=True)
         lsb = ttk.Scrollbar(lf, command=self.log.yview)
         lsb.pack(side="left", fill="y")
@@ -450,10 +532,7 @@ class BatchExportWindow(tk.Toplevel):
                 f.write(f"{now_iso()}  {m}\n")
         except Exception:
             pass
-        self.log.config(state="normal")
-        self.log.insert("end", m + "\n")
-        self.log.see("end")
-        self.log.config(state="disabled")
+        _append_capped(self.log, m)
 
     def _emit(self, kind, *a):          # called from worker threads
         self.q.put((kind, a))
@@ -518,10 +597,19 @@ class BatchExportWindow(tk.Toplevel):
         self.pause_evt.clear()
         self.pause_btn.config(text="Pause")
 
+        if not self.app.case:
+            self.app.case = CaseLog(CASE_DIR, self.app.serial or "unknown")
+        case = self.app.case
+
         def work():
             try:
                 names = wb.scan_chats(self.app.adb, self.app.cur_size, emit=self._emit,
                                       pause=self.pause_evt, stop=self.scan_stop)
+                if names:                    # the scanned list is evidence too: keep it in the case
+                    out = wb.save_names_csv([(n, "scanned") for n in names],
+                                            Path(case.dir) / f"scanned_chats_{core.now_stamp()}.csv")
+                    case.record_file(Path(out), "chat list scan")
+                    self._emit("log", f"scan saved in the case folder: {Path(out).name}")
                 self._emit("scan_done", names)
             except Exception as e:
                 self._emit("log", f"scan error: {e}")
@@ -592,9 +680,9 @@ class BatchExportWindow(tk.Toplevel):
 
     def _clear_resume(self):
         self.resume_path = None
-        self.resume_lbl.config(text="(off)", foreground="#8a8")
+        self.resume_lbl.config(text="(automatic: this phone's last session)", foreground="#5f6b7a")
 
-    def rolling_start(self):
+    def rolling_start(self, only=None):
         """Auto page-by-page: scan a screenful, export the undone ones, scroll, repeat. Writes CSV."""
         if not self.app.adb:
             messagebox.showinfo("No device", "Connect a device first.", parent=self)
@@ -606,20 +694,16 @@ class BatchExportWindow(tk.Toplevel):
             self.app.case = CaseLog(CASE_DIR, self.app.serial or "unknown")
         # capture the scan state (order + selection) BEFORE clearing the tree
         scan_order = [self.tree.item(iid, "values")[0] for iid in self.tree.get_children()]
-        sel_names = {self.tree.item(iid, "values")[0] for iid in self.tree.selection()}
-        startf = self.startfrom_var.get().strip() or None
-        # SAME-DEVICE CONTINUITY: if the user didn't explicitly pick a CSV, auto-continue THIS
-        # device's most recent CSV (keyed on serial) in place - so restarting on the same mobile
-        # keeps the same CSV and all prior progress. A different mobile (different serial) finds
-        # none and starts a fresh CSV.
-        resume = self.resume_path
-        csv_override = self.resume_path          # continue the picked file in place
-        if not resume:
-            prev = wb.latest_csv_for_serial(str(CASE_DIR), self.app.serial, self._package())
-            if prev:
-                resume = prev
-                csv_override = prev
-                self._log(f"continuing this device's previous CSV: {prev}")
+        sel_names = set(only) if only else {self.tree.item(iid, "values")[0] for iid in self.tree.selection()}
+        startf = None if only else (self.startfrom_var.get().strip() or None)
+        # SAME-DEVICE CONTINUITY: the picked CSV, or THIS device's most recent one, is READ so its
+        # finished chats are skipped - but progress is always written into the CURRENT case folder
+        # (next to this session's contacts and exports); the earlier CSV is left untouched.
+        resume, csv_out = wb.plan_csv(self.app.case.dir, str(CASE_DIR), self.app.serial,
+                                      self._package(), picked=self.resume_path)
+        if resume and Path(resume) != Path(csv_out):
+            self._log(f"continuing this device's earlier progress from: {resume}")
+        self._log(f"CSV for this session: {csv_out}")
         self.tree.delete(*self.tree.get_children())
         self.row_of.clear()
         self.order = []
@@ -629,7 +713,7 @@ class BatchExportWindow(tk.Toplevel):
             self.app._live_pause.set()
         self.start_btn.config(state="disabled")
         self.batch = wb.RollingBatch(self.app.adb, self.app.case, self.app.cur_size,
-                                     self._emit, pause=self.pause_evt, csv_path=csv_override,
+                                     self._emit, pause=self.pause_evt, csv_path=csv_out,
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
                                      resume_from=resume,
@@ -676,37 +760,22 @@ class BatchExportWindow(tk.Toplevel):
             messagebox.showerror("Save failed", str(e), parent=self)
 
     def start(self):
-        if not self.app.adb:
-            messagebox.showinfo("No device", "Connect a device first.", parent=self)
-            return
-        if self.batch and self.batch.is_alive():
-            messagebox.showinfo("Busy", "A batch is already running.", parent=self)
-            return
-        sel = self.tree.selection()
-        if not sel:
+        """Export the selected chats. Same engine as Auto (verified scrolling, Archived chats, the
+        end-of-run retry), limited to the selection."""
+        if not self.tree.selection():
             messagebox.showinfo("Pick chats", "Select one or more chats first (Ctrl/Shift-click, or Select all).", parent=self)
             return
-        chosen = {self.tree.item(iid, "values")[0] for iid in sel}
-        names = [n for n in self.order if n in chosen]     # keep scanned order
-        for iid in self.tree.get_children():
-            nm = self.tree.item(iid, "values")[0]
-            st = "pending" if nm in chosen else ""
-            self.tree.set(iid, "status", st)
-            self.tree.item(iid, tags=(self._tag(st),))
-        if not self.app.case:
-            self.app.case = CaseLog(CASE_DIR, self.app.serial or "unknown")
-        if getattr(self.app, "_live_pause", None):
-            self.app._live_pause.set()          # let the batch own the screen
-        self.pause_evt.clear()
-        self.pause_btn.config(text="Pause")
-        self.start_btn.config(state="disabled")
-        self._log(f"starting batch over {len(names)} chat(s)")
-        self.batch = wb.WhatsAppBatch(self.app.adb, self.app.case, self.app.cur_size,
-                                      names, self.order, self._emit, pause=self.pause_evt,
-                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
-                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
-                                      package=self._package())
-        self.batch.start()
+        self.rolling_start()
+
+    def export_one(self):
+        """Export ONE chat by name (e.g. one that failed): finds it in the chat list or the Archived
+        chats, exports it, and stops."""
+        sel = self.tree.selection()
+        guess = self.tree.item(sel[0], "values")[0] if len(sel) == 1 else ""
+        name = simpledialog.askstring("Export one chat", "Chat name exactly as WhatsApp shows it:",
+                                      initialvalue=guess, parent=self)
+        if name and name.strip():
+            self.rolling_start(only={name.strip()})
 
     def stop(self):
         self.scan_stop.set()                 # stop a running scan
@@ -816,8 +885,9 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("ADB Macro Studio")
-        root.geometry("1060x700")
-        root.minsize(900, 600)
+        root.geometry(_fit(root, 1120, 760))
+        root.minsize(min(_px(root, 940), root.winfo_screenwidth() - 40),
+                     min(_px(root, 600), root.winfo_screenheight() - 110))
 
         self.q: queue.Queue = queue.Queue()
         self.adb_path = find_adb()
@@ -850,11 +920,17 @@ class App:
 
     # ---- UI construction -------------------------------------------------
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=6)
+        head = ttk.Frame(self.root, padding=(12, 10, 12, 0))
+        head.pack(side="top", fill="x")
+        ttk.Label(head, text="ADB Macro Studio", style="Header.TLabel").pack(side="left")
+        ttk.Label(head, text="offline WhatsApp evidence collection", style="Sub.TLabel").pack(side="left", padx=10)
+        ttk.Button(head, text="WhatsApp export...", style="Accent.TButton",
+                   command=self.open_batch_export).pack(side="right")
+        top = ttk.Frame(self.root, padding=(12, 8))
         top.pack(side="top", fill="x")
         ttk.Label(top, text="Device").pack(side="left")
         self.dev_var = tk.StringVar()
-        self.dev_box = ttk.Combobox(top, textvariable=self.dev_var, width=28, state="readonly")
+        self.dev_box = ttk.Combobox(top, textvariable=self.dev_var, width=34, state="readonly")
         self.dev_box.pack(side="left", padx=4)
         ttk.Button(top, text="Refresh", command=self.refresh_devices).pack(side="left")
         ttk.Button(top, text="Connect", command=self.connect).pack(side="left", padx=4)
@@ -868,7 +944,6 @@ class App:
         ttk.Checkbutton(top, text="Live view", variable=self.live_var).pack(side="right")
 
         main = ttk.Panedwindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True)
 
         # left: live canvas
         left = ttk.Frame(main, padding=6)
@@ -891,6 +966,8 @@ class App:
 
         stepf = ttk.LabelFrame(right, text="Steps  (Ctrl/Shift-click to select several, then 'Save as action')",
                                padding=6)
+        lower = ttk.Frame(right)                  # record/actions/playback keep their full size;
+        lower.pack(side="bottom", fill="x")       # the step list takes whatever height is left
         stepf.pack(fill="both", expand=True)
         self.step_list = tk.Listbox(stepf, height=8, activestyle="dotbox", selectmode="extended")
         self.step_list.pack(side="left", fill="both", expand=True)
@@ -900,13 +977,16 @@ class App:
         self.step_list.config(yscrollcommand=sb.set)
         sbtn = ttk.Frame(stepf)
         sbtn.pack(side="left", fill="y", padx=4)
-        ttk.Button(sbtn, text="Save as action", width=13, command=self.save_action).pack(pady=(2, 8))
-        for txt, cmd in (("Add...", self.add_step), ("Edit", self.edit_step),
-                         ("Delete", self.del_step), ("Up", lambda: self.move_step(-1)),
-                         ("Down", lambda: self.move_step(1)), ("Clear", self.clear_steps)):
-            ttk.Button(sbtn, text=txt, width=13, command=cmd).pack(pady=2)
+        ttk.Button(sbtn, text="Save as action", command=self.save_action).grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(2, 8))
+        for i, (txt, cmd) in enumerate((("Add...", self.add_step), ("Edit", self.edit_step),
+                                        ("Delete", self.del_step), ("Clear", self.clear_steps),
+                                        ("Up", lambda: self.move_step(-1)),
+                                        ("Down", lambda: self.move_step(1)))):
+            ttk.Button(sbtn, text=txt, width=8, command=cmd).grid(row=1 + i // 2, column=i % 2,
+                                                                  padx=2, pady=2, sticky="ew")
 
-        recf = ttk.LabelFrame(right, text="Record from phone", padding=6)
+        recf = ttk.LabelFrame(lower, text="Record from phone", padding=6)
         recf.pack(fill="x", pady=4)
         self.cap_btn = ttk.Button(recf, text="Capture one tap", command=self.arm_capture)
         self.cap_btn.pack(side="left")
@@ -915,7 +995,7 @@ class App:
         self.rec_lbl = ttk.Label(recf, text="idle")
         self.rec_lbl.pack(side="left", padx=8)
 
-        macf = ttk.LabelFrame(right, text="Actions / Sequences", padding=6)
+        macf = ttk.LabelFrame(lower, text="Actions / Sequences", padding=6)
         macf.pack(fill="x", pady=4)
         ttk.Label(macf, text="Name").grid(row=0, column=0, sticky="e")
         self.name_var = tk.StringVar(value="action1")
@@ -932,7 +1012,7 @@ class App:
                    command=self.open_batch_export).grid(row=3, column=0, columnspan=3,
                                                         pady=(4, 0), sticky="ew")
 
-        playf = ttk.LabelFrame(right, text="Playback", padding=6)
+        playf = ttk.LabelFrame(lower, text="Playback", padding=6)
         playf.pack(fill="x", pady=4)
         ttk.Label(playf, text="Loops").grid(row=0, column=0, sticky="e")
         self.loops_var = tk.IntVar(value=1)
@@ -948,8 +1028,10 @@ class App:
         ttk.Button(playf, text="Stop", command=self.stop_run).grid(row=1, column=3, pady=6)
 
         logf = ttk.LabelFrame(self.root, text="Log", padding=4)
-        logf.pack(fill="both", expand=False)
-        self.log_txt = tk.Text(logf, height=8, wrap="word")
+        logf.pack(side="bottom", fill="x", padx=12, pady=(0, 10))   # always visible
+        main.pack(fill="both", expand=True)
+        self.log_txt = tk.Text(logf, height=4, wrap="word", relief="flat", font=("Consolas", 9),
+                               background="#fbfbfc")
         self.log_txt.pack(side="left", fill="both", expand=True)
         lsb = ttk.Scrollbar(logf, command=self.log_txt.yview)
         lsb.pack(side="left", fill="y")
@@ -963,10 +1045,7 @@ class App:
                 f.write(line + "\n")
         except Exception:
             pass
-        self.log_txt.config(state="normal")
-        self.log_txt.insert("end", line + "\n")
-        self.log_txt.see("end")
-        self.log_txt.config(state="disabled")
+        _append_capped(self.log_txt, line)
 
     def _adblog(self, msg):          # called from any thread
         self.q.put(("log", msg))
@@ -1168,7 +1247,7 @@ class App:
                     if msg:
                         self.q.put(("log", msg))
                     self._live_stop.wait(2.0)
-                self._live_stop.wait((LIVE_INTERVAL_MS * 3 if busy else LIVE_INTERVAL_MS) / 1000)
+                self._live_stop.wait((LIVE_BUSY_MS if busy else LIVE_INTERVAL_MS) / 1000)
                 continue
             self._live_stop.wait(LIVE_INTERVAL_MS / 1000)
 
@@ -1561,11 +1640,13 @@ def main():
     MACRO_DIR.mkdir(parents=True, exist_ok=True)
     CASE_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
+    try:                                   # crisp text on scaled (125%/150%) Windows displays
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
         pass
+    root = tk.Tk()
+    apply_theme(root)
     App(root)
     root.mainloop()
 

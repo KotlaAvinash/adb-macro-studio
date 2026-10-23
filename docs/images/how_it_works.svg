@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="960" height="430" fill="#f4f6f8"/>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <text x="480" y="34" text-anchor="middle" font-size="20" font-weight="600" fill="#0f172a">How one chat export travels (no internet, no cloud)</text>
+
+  <!-- phone -->
+  <rect x="30" y="70" width="190" height="230" rx="16" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="125" y="98" text-anchor="middle" font-size="15" font-weight="600" fill="#0f172a">Phone</text>
+  <text x="125" y="128" text-anchor="middle" font-size="13" fill="#334155">WhatsApp / Business</text>
+  <text x="125" y="160" text-anchor="middle" font-size="12" fill="#5f6b7a">1. open chat</text>
+  <text x="125" y="180" text-anchor="middle" font-size="12" fill="#5f6b7a">2. Export chat</text>
+  <text x="125" y="200" text-anchor="middle" font-size="12" fill="#5f6b7a">(with media, else</text>
+  <text x="125" y="216" text-anchor="middle" font-size="12" fill="#5f6b7a">without media)</text>
+  <text x="125" y="244" text-anchor="middle" font-size="12" fill="#5f6b7a">3. share via</text>
+  <text x="125" y="260" text-anchor="middle" font-size="12" fill="#5f6b7a">Quick Share</text>
+
+  <!-- tool -->
+  <rect x="385" y="70" width="190" height="230" rx="16" fill="#ffffff" stroke="#128c7e" stroke-width="2"/>
+  <text x="480" y="98" text-anchor="middle" font-size="15" font-weight="600" fill="#0f172a">This tool (PC)</text>
+  <text x="480" y="128" text-anchor="middle" font-size="12" fill="#5f6b7a">reads the screen,</text>
+  <text x="480" y="146" text-anchor="middle" font-size="12" fill="#5f6b7a">taps buttons by their</text>
+  <text x="480" y="164" text-anchor="middle" font-size="12" fill="#5f6b7a">internal ids (any language,</text>
+  <text x="480" y="182" text-anchor="middle" font-size="12" fill="#5f6b7a">screen size or brand)</text>
+  <text x="480" y="210" text-anchor="middle" font-size="12" fill="#5f6b7a">walks the chat list and</text>
+  <text x="480" y="228" text-anchor="middle" font-size="12" fill="#5f6b7a">the Archived chats,</text>
+  <text x="480" y="246" text-anchor="middle" font-size="12" fill="#5f6b7a">retries failures at the end</text>
+
+  <!-- quick share -->
+  <rect x="740" y="70" width="190" height="230" rx="16" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="835" y="98" text-anchor="middle" font-size="15" font-weight="600" fill="#0f172a">Quick Share (PC)</text>
+  <text x="835" y="128" text-anchor="middle" font-size="12" fill="#5f6b7a">receives the .zip over</text>
+  <text x="835" y="146" text-anchor="middle" font-size="12" fill="#5f6b7a">Bluetooth + Wi-Fi Direct</text>
+  <text x="835" y="174" text-anchor="middle" font-size="12" fill="#5f6b7a">Accept is clicked</text>
+  <text x="835" y="192" text-anchor="middle" font-size="12" fill="#5f6b7a">automatically, only</text>
+  <text x="835" y="210" text-anchor="middle" font-size="12" fill="#5f6b7a">while our send is due</text>
+
+  <line x1="225" y1="150" x2="380" y2="150" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="302" y="140" text-anchor="middle" font-size="12" fill="#334155">USB (adb)</text>
+  <line x1="380" y1="200" x2="225" y2="200" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="302" y="220" text-anchor="middle" font-size="12" fill="#334155">taps / reads</text>
+  <path d="M125,300 C125,350 835,350 835,305" fill="none" stroke="#475569" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#a)"/>
+  <text x="480" y="345" text-anchor="middle" font-size="12" fill="#334155">the export file goes phone → PC directly (offline)</text>
+
+  <!-- case folder -->
+  <rect x="200" y="362" width="560" height="56" rx="12" fill="#e6f4f1" stroke="#128c7e"/>
+  <text x="480" y="384" text-anchor="middle" font-size="14" font-weight="600" fill="#0b6b60">Case folder (one per session)</text>
+  <text x="480" y="404" text-anchor="middle" font-size="12" fill="#334155">exported_chats.csv · exports/*.zip · hashes.csv (SHA-256) · contacts</text>
+  <line x1="835" y1="300" x2="762" y2="380" stroke="#128c7e" stroke-width="2" marker-end="url(#a)"/>
+</svg>

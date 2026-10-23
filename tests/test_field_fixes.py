@@ -98,6 +98,50 @@ def run_accept(windows, timeout=10, exe_paths=(), launched=None):
     return clicked, logs
 
 
+# ----------------------------------------------------------------- one Accept watcher per run
+class TestAcceptWatcher(unittest.TestCase):
+    """A long run used to start a NEW 180-second UI-polling thread for every chat attempt; on failures
+    and retries several ran at once. One watcher serves the whole run, armed only while a transfer
+    of ours is expected."""
+
+    def setUp(self):
+        self.win = quick_share_window()
+        for p in (mock.patch.dict(sys.modules, {"pywinauto": fake_pywinauto([self.win])}),
+                  mock.patch.object(qs_accept, "time", FakeClock()),
+                  mock.patch.object(qs_accept, "QS_EXE_PATHS", ())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_accept_is_clicked_only_while_armed(self):
+        w = qs_accept.AcceptWatcher(log=lambda m: None)
+        accept = FakeCtrl("Accept")
+        self.win.controls = [accept]
+        w.poll_once()
+        self.assertFalse(accept.clicked)             # not ours: nobody asked for a transfer
+        w.arm(60)
+        w.poll_once()
+        self.assertTrue(accept.clicked)
+        self.assertFalse(w.armed())                  # one click per armed transfer
+
+    def test_arming_again_reuses_the_one_thread(self):
+        started = []
+        with mock.patch.object(qs_accept.threading, "Thread",
+                               lambda *a, **k: started.append(1) or mock.Mock()):
+            w = qs_accept.AcceptWatcher(log=lambda m: None)
+            for _ in range(70):
+                w.arm(180)
+        self.assertEqual(len(started), 1)
+
+    def test_an_armed_window_expires(self):
+        w = qs_accept.AcceptWatcher(log=lambda m: None)
+        w.arm(10)
+        qs_accept.time.sleep(11)
+        accept = FakeCtrl("Accept")
+        self.win.controls = [accept]
+        w.poll_once()
+        self.assertFalse(accept.clicked)
+
+
 # ----------------------------------------------------------------- Quick Share auto-Accept
 class TestQuickShareAccept(unittest.TestCase):
     def test_does_not_click_inside_a_browser_tab_whose_title_mentions_quickshare(self):
