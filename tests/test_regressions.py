@@ -691,6 +691,16 @@ class TestSecurityReview(unittest.TestCase):
         self.assertEqual(core._redact_cmd(["shell", "input", "tap", "1", "2"]),
                          ["shell", "input", "tap", "1", "2"])   # non-text untouched
 
+    # after a send we must leave ANY non-WhatsApp foreground (Quick Share 'Completed' screen etc.)
+    def test_back_to_list_detects_non_whatsapp_foreground(self):
+        def fg(line):
+            return type("A", (), {"shell": lambda self, *a, **k: f"  mCurrentFocus=Window{{ {line} }}"})()
+        self.assertTrue(wb.on_whatsapp_foreground(fg("u0 com.whatsapp/.HomeActivity")))
+        self.assertFalse(wb.on_whatsapp_foreground(
+            fg("u0 com.google.android.gms/.quickshare.CompleteActivity")))
+        self.assertFalse(wb.on_whatsapp_foreground(
+            fg("u0 com.samsung.android.app.sharelive/.ReceiveActivity")))
+
     # F-10: co-visible same-name chats are surfaced (not silently merged)
     def test_f10_duplicate_names_detected(self):
         self.assertEqual(wb.duplicate_names(["A", "B", "A", "C"]), {"A"})

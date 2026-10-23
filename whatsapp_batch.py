@@ -278,6 +278,37 @@ def on_share_sheet(adb):
     return False
 
 
+def foreground_focus(adb):
+    """The current foreground-window line (mCurrentFocus) in lowercase, or '' if unreadable."""
+    try:
+        out = adb.shell("dumpsys", "window", quiet=True)
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        if "mCurrentFocus" in line:
+            return line.lower()
+    return ""
+
+
+def on_whatsapp_foreground(adb):
+    """True = WhatsApp is the foreground app, False = a DIFFERENT app is (e.g. the Quick Share
+    completion screen, which lives in its own app and is NOT the Android chooser), None = unreadable.
+    Lets us BACK out of ANY post-send Quick Share screen - not only the share chooser - so the run
+    reliably returns to the chat list instead of falling back to a scroll-resetting relaunch."""
+    line = foreground_focus(adb)
+    if not line:
+        return None
+    if "com.whatsapp" in line:
+        return True
+    # a known non-WhatsApp surface we must leave (Quick Share / Nearby / Samsung share / chooser)
+    for marker in ("quickshare", "quick_share", "nearby", "sharesheet", "sharelive", "intentresolver",
+                   "chooseractivity", "resolveractivity", "com.google.android.gms",
+                   "com.samsung.android.app.sharelive", "mtp", "directshare"):
+        if marker in line:
+            return False
+    return None            # some other/unknown readable window - don't force BACK blindly
+
+
 def dismiss_anr(adb):
     """Detect Android's "WhatsApp isn't responding" (ANR) dialog and tap WAIT to keep the app
     alive, instead of letting the run stall behind it (or the app get killed). WhatsApp ANRs when
@@ -649,7 +680,10 @@ def _back_to_list(adb, tries=14):
     scroll to the top and makes long runs re-traverse / stop early)."""
     none_streak = 0
     for _ in range(tries):
-        if on_share_sheet(adb):            # unreadable Quick Share chooser - just BACK out of it
+        # If a NON-WhatsApp app is foreground (the Quick Share picker OR its 'Completed' screen,
+        # Nearby, Samsung share, the chooser, ...), BACK straight out of it - this is what returns us
+        # to WhatsApp after a send, instead of waiting out unreadable frames.
+        if on_share_sheet(adb) or on_whatsapp_foreground(adb) is False:
             adb.key("BACK"); time.sleep(1.2); none_streak = 0; continue
         st = on_chat_list(adb)
         if st:
@@ -853,6 +887,13 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         if time.time() < floor_until:
             continue                                   # can't see progress yet -> honour the floor
         break                                          # no file, no progress -> genuinely done/failed
+    if not res:
+        # LAST-CHANCE catch: the file may have landed right at the wait boundary (or while we were
+        # navigating). Grab a new, stable, VALID zip from the folder before declaring failure - so a
+        # good transfer is validated and recorded instead of wrongly failed/duplicated.
+        late = _late_arrived_file(save_dir, before)
+        if late:
+            res = late
     _back_to_list(adb)
     if not res:
         # the file never arrived AND the transfer stopped showing progress: a real failure (PC not

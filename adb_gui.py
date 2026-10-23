@@ -1087,13 +1087,19 @@ class App:
 
     def _live_loop(self):
         while not self._live_stop.is_set():
-            if self.live_var.get() and not self._live_pause.is_set() and self.adb:
+            if self.live_var.get() and self.adb:
+                # Keep MIRRORING even while a batch/scan is running (so you can watch what adb is
+                # doing live) - just at a slower cadence then, to limit contention with the batch's
+                # own adb traffic. 'Live view' unticked still turns it off entirely.
+                busy = self._live_pause.is_set()
                 try:
                     png = self.adb.screencap()
                     self.q.put(("liveframe", png))
                 except Exception as e:
                     self.q.put(("log", f"live view: {e}"))
                     self._live_stop.wait(2.0)
+                self._live_stop.wait((LIVE_INTERVAL_MS * 3 if busy else LIVE_INTERVAL_MS) / 1000)
+                continue
             self._live_stop.wait(LIVE_INTERVAL_MS / 1000)
 
     def _render_png(self, png: bytes):
