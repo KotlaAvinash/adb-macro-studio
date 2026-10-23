@@ -381,6 +381,14 @@ class BatchExportWindow(tk.Toplevel):
         ttk.Label(cfg, text="Save folder:").pack(side="left", padx=(10, 0))
         self.dir_var = tk.StringVar(value=wb.SAVE_DIR)
         ttk.Entry(cfg, textvariable=self.dir_var, width=26).pack(side="left", padx=4)
+        # which WhatsApp to export (only the installed ones are offered)
+        ttk.Label(cfg, text="App:").pack(side="left", padx=(10, 0))
+        apps = wb.installed_whatsapp(self.app.adb) if self.app.adb else []
+        self._app_pkgs = {wb.WA_PACKAGES[pk]: pk for pk in (apps or ["com.whatsapp"])}
+        self.app_var = tk.StringVar(value=next(iter(self._app_pkgs)))
+        ttk.Combobox(cfg, textvariable=self.app_var, values=list(self._app_pkgs), state="readonly",
+                     width=18).pack(side="left", padx=4)
+        wb.label_asker = self._ask_label     # 'Export chat' in a language not seen before
 
         # resume / start-from controls (recover after a lock/crash without redoing work)
         cfg2 = ttk.Frame(self, padding=(6, 2))
@@ -449,6 +457,47 @@ class BatchExportWindow(tk.Toplevel):
 
     def _emit(self, kind, *a):          # called from worker threads
         self.q.put((kind, a))
+
+    def _package(self):
+        return self._app_pkgs.get(self.app_var.get(), "com.whatsapp")
+
+    def _ask_label(self, key, options):
+        """Called from the batch thread when 'Export chat' isn't known in the phone's language:
+        ask the examiner (on the UI thread) and wait for the answer. None = not answered."""
+        box = {"done": threading.Event(), "answer": None}
+        self._label_box = box                # released by _close if the window goes away
+        self.q.put(("ask_label", (key, options, box)))
+        box["done"].wait()
+        return box["answer"]
+
+    def _show_label_question(self, key, options, box):
+        dlg = tk.Toplevel(self)
+        dlg.title("Teach the tool this language")
+        dlg.transient(self)
+        ttk.Label(dlg, padding=10, wraplength=420, justify="left",
+                  text="The phone shows WhatsApp's menu in a language this tool hasn't seen yet.\n\n"
+                       "Which of these items means 'Export chat'? (Look at the phone if unsure.) "
+                       "It is remembered for this phone language, so you're only asked once.").pack()
+        lb = tk.Listbox(dlg, height=min(10, len(options)), width=48, exportselection=False)
+        for o in options:
+            lb.insert("end", o)
+        lb.pack(padx=10)
+
+        def finish(answer):
+            box["answer"] = answer
+            box["done"].set()
+            dlg.destroy()
+
+        def use():
+            sel = lb.curselection()
+            if sel:
+                finish(options[sel[0]])
+        btns = ttk.Frame(dlg, padding=10)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="This is 'Export chat'", command=use).pack(side="right")
+        ttk.Button(btns, text="None of these - skip", command=lambda: finish(None)).pack(side="right", padx=6)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        self._log("asking which menu item means 'Export chat' (phone language not seen before)")
 
     def _tag(self, status):
         return status if status in self.STATUS_TAGS else ("fail" if status.startswith("fail") else "")
@@ -566,7 +615,7 @@ class BatchExportWindow(tk.Toplevel):
         resume = self.resume_path
         csv_override = self.resume_path          # continue the picked file in place
         if not resume:
-            prev = wb.latest_csv_for_serial(str(CASE_DIR), self.app.serial)
+            prev = wb.latest_csv_for_serial(str(CASE_DIR), self.app.serial, self._package())
             if prev:
                 resume = prev
                 csv_override = prev
@@ -584,7 +633,7 @@ class BatchExportWindow(tk.Toplevel):
                                      pc_name=self.pc_var.get().strip() or wb.PC_NAME,
                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
                                      resume_from=resume,
-                                     start_from=startf)
+                                     start_from=startf, package=self._package())
         self.batch.scan_order = scan_order or None     # lets start-from go directionally (up/down)
         # start-from takes precedence; otherwise a selection means "export only these"
         if startf:
@@ -655,7 +704,8 @@ class BatchExportWindow(tk.Toplevel):
         self.batch = wb.WhatsAppBatch(self.app.adb, self.app.case, self.app.cur_size,
                                       names, self.order, self._emit, pause=self.pause_evt,
                                       pc_name=self.pc_var.get().strip() or wb.PC_NAME,
-                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR)
+                                      save_dir=self.dir_var.get().strip() or wb.SAVE_DIR,
+                                      package=self._package())
         self.batch.start()
 
     def stop(self):
@@ -668,7 +718,9 @@ class BatchExportWindow(tk.Toplevel):
         try:
             while True:
                 kind, a = self.q.get_nowait()
-                if kind == "scan_progress":
+                if kind == "ask_label":
+                    self._show_label_question(*a)
+                elif kind == "scan_progress":
                     self.status_lbl.config(text=f"scanning... {a[0]} chats so far")
                 elif kind == "scan_done":
                     self.order = a[0]
@@ -742,6 +794,11 @@ class BatchExportWindow(tk.Toplevel):
         self.after(100, self._pump)
 
     def _close(self):
+        if wb.label_asker == self._ask_label:
+            wb.label_asker = None
+        box = getattr(self, "_label_box", None)
+        if box:
+            box["done"].set()                # never leave the batch thread waiting on a closed window
         if self.batch:
             self.batch.stop()
         self.scan_stop.set()
@@ -1019,6 +1076,13 @@ class App:
         if include_media and src != "device":
             media_pick = filedialog.askdirectory(
                 title="Pick the WhatsApp 'Media' folder (or its parent) - Cancel to skip media") or None
+        package = "com.whatsapp"
+        if src == "device":
+            apps = wb.installed_whatsapp(adb)
+            if apps == ["com.whatsapp.w4b"] or (len(apps) > 1 and messagebox.askyesno(
+                    "Which WhatsApp?", "Both WhatsApp and WhatsApp Business are installed.\n\n"
+                    "Yes = WhatsApp Business backup\nNo = WhatsApp backup")):
+                package = "com.whatsapp.w4b"
 
         def work():
             try:
@@ -1032,11 +1096,11 @@ class App:
                         contacts = _load_contacts_map(cdir)
                     except Exception as e:
                         self._adblog(f"backup: contacts step skipped ({e!r})")
-                    crypt, _dg = wab.pull_backup(adb, out, emit=self._adblog)
+                    crypt, _dg = wab.pull_backup(adb, out, emit=self._adblog, package=package)
                     if not crypt:
                         return
                     if include_media:
-                        media_root = wab.pull_media(adb, out, emit=self._adblog)
+                        media_root = wab.pull_media(adb, out, emit=self._adblog, package=package)
                     db_path = os.path.join(out, "msgstore.db")
                     self._adblog("backup: pick the 64-char backup key file for THIS device...")
                     kpick = filedialog.askopenfilename(title="Backup key file (e.g. Wakey.txt)")

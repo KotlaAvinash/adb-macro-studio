@@ -243,7 +243,23 @@ isn't available.
 > ```
 > **Without it the tool still works** — the export and Quick Share send run normally and the file
 > is still received and hashed — you just click **Accept** yourself on each transfer. If your
-> Windows is not in English, adjust the accept label in `qs_accept.py` (`ACCEPT_LABELS`).
+> Windows is not in English, adjust the accept label in `qs_accept.py` (`ACCEPT_LABELS`): Quick
+> Share for Windows gives its buttons no language-free id, only their visible text.
+
+### Any phone language, any brand, WhatsApp Business
+- **Phone language:** WhatsApp's buttons are found by their internal ids, which are the same in
+  every language. The one exception is **Export chat**, which sits in the same menu as **Clear chat**
+  with the same id, so it is matched by its text. English is built in. For any other language,
+  the first time the tool asks you to pick the item that means "Export chat" from the phone's
+  own menu. It remembers your answer for that phone language (`.ui_labels.json`), so you are asked
+  once. The tool never guesses a menu item.
+- **Phone brand:** Samsung and Google Quick Share are both handled. The Quick Share tap position the
+  tool learns is saved per **phone model** (not only per screen size), so it is never reused on a
+  different phone.
+- **WhatsApp Business:** pick **App: WhatsApp Business** in the batch window. It is only offered
+  when it is installed. Its progress is kept in its own CSV, `exported_chats_business.csv`, so
+  resuming one app never skips the other's chats. Backup extraction reads its folder
+  (`Android/media/com.whatsapp.w4b/WhatsApp Business`).
 
 ### How the rolling export works
 It does **not** pre-scan the whole list. Instead it reads the chats currently on screen, exports

@@ -58,8 +58,123 @@ def _save_coords():
     except Exception:
         pass
 
+# --- which WhatsApp ------------------------------------------------------------------------------
+WA_PACKAGES = {"com.whatsapp": "WhatsApp", "com.whatsapp.w4b": "WhatsApp Business"}
+
+
+def installed_whatsapp(adb):
+    """The WhatsApp apps installed on the phone (regular first), e.g. ['com.whatsapp.w4b']."""
+    try:
+        have = set(adb.packages("com.whatsapp"))
+    except Exception:
+        return []
+    return [p for p in WA_PACKAGES if p in have]
+
+
+def wa_package(adb):
+    """The WhatsApp app this run drives (set by the batch; regular WhatsApp by default)."""
+    return getattr(adb, "wa_package", None) or "com.whatsapp"
+
+
+def csv_name(package=None):
+    """Each app keeps its own progress CSV, so resuming one never skips the other's chats."""
+    return "exported_chats_business.csv" if package == "com.whatsapp.w4b" else "exported_chats.csv"
+
+
+# --- on-screen words that have no language-free id -----------------------------------------------
+# Every other step finds its button by resource-id (identical in every language, recorded from a real
+# phone). "Export chat" is the exception: it sits next to "Clear chat" in the same menu with the same
+# id and a position that differs per chat type, so it is matched by its text - English built in, any
+# other language learned once from the examiner (label_asker) and remembered per phone language.
+# WhatsApp's own translations can't be read off the phone (they ship in a private compressed format).
+DEFAULT_LABELS = {"export_chat": ("Export chat",)}
+LABEL_FILE = str(Path(__file__).resolve().parent / ".ui_labels.json")
+label_asker = None        # GUI hook: fn(key, options) -> the option meaning `key`, or None
+
+
+def phone_locale(adb):
+    loc = getattr(adb, "_wb_locale", None)
+    if loc is None:
+        loc = ""
+        for prop in ("persist.sys.locale", "ro.product.locale"):
+            try:
+                loc = (adb.getprop(prop) or "").strip()
+            except Exception:
+                loc = ""
+            if loc:
+                break
+        try:
+            adb._wb_locale = loc
+        except Exception:
+            pass
+    return loc or "unknown"
+
+
+def _learned_labels():
+    try:
+        with open(LABEL_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def labels(adb, key):
+    """Texts that mean `key` on this phone: built-in English + what was learned for its language."""
+    learned = _learned_labels().get(key, {}).get(phone_locale(adb), [])
+    return list(DEFAULT_LABELS.get(key, ())) + [t for t in learned if isinstance(t, str) and t]
+
+
+def learn_label(adb, key, text):
+    data = _learned_labels()
+    have = data.setdefault(key, {}).setdefault(phone_locale(adb), [])
+    if text not in have:
+        have.append(text)
+    tmp = LABEL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, LABEL_FILE)
+
+
+def _find_label(nodes, adb, key):
+    for t in labels(adb, key):
+        hit = core.find_node(nodes, t, "exact") or core.find_node(nodes, t, "contains")
+        if hit:
+            return hit
+    return None
+
+
+def _coord_key(adb, size):
+    """Learned tap positions belong to one phone MODEL and screen size: another brand with the same
+    resolution has a different share sheet, so a blind tap there could hit the wrong target."""
+    model = getattr(adb, "_wb_model", None)
+    if model is None:
+        try:
+            model = (adb.getprop("ro.product.model") or "").strip()
+        except Exception:
+            model = ""
+        try:
+            adb._wb_model = model
+        except Exception:
+            pass
+    return f"{model or 'unknown'}|{size[0]}x{size[1]}"
+
+
+def _learned_coords(adb, size):
+    """This phone's learned positions. Positions saved before they were kept per model (key = screen
+    size only) move to the first model that uses them, so a second model never inherits them."""
+    key, legacy = _coord_key(adb, size), f"{size[0]}x{size[1]}"
+    if key not in _COORDS and legacy in _COORDS:
+        _COORDS[key] = _COORDS.pop(legacy)
+        _save_coords()
+    return _COORDS.get(key, {})
+
+
 CONTACT_ID = "conversations_row_contact_name"     # WhatsApp chat-name node
-LIST_MARKER = "Ask Meta AI or Search"             # present on the chat list
+LIST_MARKER = "Ask Meta AI or Search"             # present on the chat list (English)
+LIST_IDS = ("my_search_bar", "conversations_row_contact_name")   # the chat list, in any language
+CHAT_ID = "conversation_root_layout"              # an open chat, in any language
+OVERFLOW_ID = "menuitem_overflow"                 # the 3-dots button (list AND chat toolbar)
 CHAT_MARKER = "More options"                       # present inside a chat
 
 # The proven single-chat export flow (with-media, fallback to without-media).
@@ -202,7 +317,11 @@ def on_chat_list(adb):
     nodes = _nodes(adb)
     if not nodes:
         return None
+    if any(n["id"].endswith("/" + CHAT_ID) for n in nodes):
+        return False
     if core.find_node(nodes, LIST_MARKER, "contains") is not None:
+        return True
+    if any(n["id"].endswith("/" + LIST_IDS[0]) for n in nodes) and _chat_rows(nodes):
         return True
     # robust fallback: several chat-name rows on screen means we're on the list, even if the
     # search-hint text differs by WhatsApp version/locale (an open chat shows no such rows).
@@ -298,8 +417,10 @@ def on_whatsapp_foreground(adb):
     line = foreground_focus(adb)
     if not line:
         return None
-    if "com.whatsapp" in line:
+    if f" {wa_package(adb)}/" in line:
         return True
+    if any(f" {p}/" in line for p in WA_PACKAGES):
+        return False           # the OTHER WhatsApp app is in front (e.g. regular during a Business run)
     # a known non-WhatsApp surface we must leave (Quick Share / Nearby / Samsung share / chooser)
     for marker in ("quickshare", "quick_share", "nearby", "sharesheet", "sharelive", "intentresolver",
                    "chooseractivity", "resolveractivity", "com.google.android.gms",
@@ -318,6 +439,10 @@ def dismiss_anr(adb):
         nodes = _nodes(adb)
     except Exception:
         return False
+    wait = core.find_node(nodes, "android:id/aerr_wait", "exact")   # Android's own ids: any language
+    if wait:
+        adb.tap(*core.node_center(wait)); time.sleep(1.0)
+        return True
     hit = (core.find_node(nodes, "isn't responding", "contains")
            or core.find_node(nodes, "not responding", "contains")
            or core.find_node(nodes, "Close app", "contains"))
@@ -553,8 +678,8 @@ def _wait_export_outcome(adb, timeout, stop=None):
         nodes = _nodes(adb)
         if core.find_node(nodes, "Can't export", "contains"):
             return "blocked"
-        if core.find_node(nodes, "Unable to export", "contains"):
-            return "unable"
+        if core.find_node(nodes, "Unable to export", "contains") or _notice_dialog(nodes):
+            return "unable"                # (a one-button notice after the media choice, any language)
         if core.find_node(nodes, "Quick Share", "contains"):
             return "qs"
         if on_share_sheet(adb):            # chooser up but unreadable -> export reached the share sheet
@@ -563,66 +688,168 @@ def _wait_export_outcome(adb, timeout, stop=None):
     return None
 
 
+def _by_id(nodes, rid):
+    return core.find_node(nodes, rid, "exact")
+
+
+def _media_dialog(nodes):
+    """The export's with/without-media question: (include, without) buttons, or None. It is a
+    standard Android dialog - 'Include media' is button1 and 'Without media' button3 (recorded on a
+    real phone), so it is found in any language."""
+    inc, without = _by_id(nodes, "android:id/button1"), _by_id(nodes, "android:id/button3")
+    if inc and without and _by_id(nodes, "android:id/message"):
+        return inc, without
+    return None
+
+
+def _notice_dialog(nodes):
+    """A one-button WhatsApp notice (message + OK only), e.g. 'Unable to export' / 'Can't export':
+    returns its OK button, or None."""
+    ok = _by_id(nodes, "android:id/button1")
+    if (ok and _by_id(nodes, "android:id/message")
+            and not _by_id(nodes, "android:id/button2") and not _by_id(nodes, "android:id/button3")):
+        return ok
+    return None
+
+
+def _more_item(nodes):
+    """The overflow menu's 'More' entry: the only item with a submenu arrow (any language)."""
+    arrow = core.find_node(nodes, "submenuarrow", "exact")
+    if arrow:
+        cy = core.node_center(arrow)[1]
+        rows = [n for n in nodes if n["clickable"] and n["bounds"][1] <= cy < n["bounds"][3]]
+        if rows:
+            return min(rows, key=core._area)
+    return core.find_node(nodes, "More", "exact")
+
+
+def _submenu_options(nodes):
+    """Item texts of an open submenu, top to bottom - what the examiner picks from."""
+    if core.find_node(nodes, "submenuarrow", "exact"):
+        return []                                       # still the first menu, not the submenu
+    items = sorted((n for n in nodes if n["id"].endswith("/title") and n["text"]),
+                   key=lambda n: n["bounds"][1])
+    return list(dict.fromkeys(n["text"] for n in items))
+
+
+def _ask_export_label(adb, nodes):
+    """'Export chat' isn't known in this phone's language: show the examiner the submenu's items and
+    learn the one they pick. Without an answer nothing is tapped - a guess could hit 'Clear chat'."""
+    options = _submenu_options(nodes)
+    if not options or label_asker is None:
+        return False
+    choice = label_asker("export_chat", options)
+    if choice not in options:
+        return False
+    learn_label(adb, "export_chat", choice)
+    return True
+
+
 def _open_export_menu(adb, stop=None, left=lambda: 1e9):
     """Reliably navigate the chat overflow menu to reveal "Export chat".
 
-    The single tap on the 3-dots ("More options") is frequently SWALLOWED by WhatsApp, so a
-    blind one-shot tap often leaves the menu closed and "More"/"Export chat" is never found.
-    Here we tap the 3-dots and CONFIRM the menu actually opened (a menu item is visible),
-    re-tapping if it didn't, then tap "More" to reveal "Export chat". Returns True when
-    "Export chat" is on screen."""
+    The single tap on the 3-dots is frequently SWALLOWED by WhatsApp, so a blind one-shot tap often
+    leaves the menu closed and "More"/"Export chat" is never found. Here we tap the 3-dots and
+    CONFIRM the menu actually opened (its "More" item is visible), re-tapping if it didn't, then tap
+    "More" to reveal "Export chat". Buttons are found by resource-id, so this works in any language.
+    Returns True when "Export chat" is on screen."""
     def _stopped():
         return stop is not None and stop.is_set()
     for _ in range(4):                                  # whole-menu attempts
         if _stopped() or left() <= 0:
             return False
-        if core.find_node(_nodes(adb), "Export chat", "contains"):
+        nodes = _nodes(adb)
+        if _find_label(nodes, adb, "export_chat"):
             return True
         # 1) open the overflow menu, verifying it actually opened
         opened = False
         for _ in range(3):                             # re-tap the 3-dots until the menu shows
             if _stopped() or left() <= 0:
                 return False
-            dots = _wait_node(adb, "More options", timeout=5, match="contains", stop=stop)
+            dots = (_wait_node(adb, OVERFLOW_ID, timeout=5, match="exact", stop=stop)
+                    or _wait_node(adb, CHAT_MARKER, timeout=1, match="contains", stop=stop))
             if dots is None:
                 break
             adb.tap(*core.node_center(dots)); time.sleep(1.4)
             nodes = _nodes(adb)
-            if core.find_node(nodes, "Export chat", "contains"):
+            if _find_label(nodes, adb, "export_chat"):
                 return True                            # some layouts show Export chat directly
-            if core.find_node(nodes, "More", "exact"):
+            if _more_item(nodes):
                 opened = True; break                   # menu is up (has the "More" item)
         if not opened:
             continue
         # 2) tap "More" -> reveals Export chat
-        if _tap_text(adb, "More", timeout=6, match="exact", delay=1.0, stop=stop):
-            if _wait_text(adb, "Export chat", timeout=6, match="contains", stop=stop):
+        adb.tap(*core.node_center(_more_item(nodes))); time.sleep(1.0)
+        end = time.time() + 6
+        while time.time() < end and not _stopped():
+            nodes = _nodes(adb)
+            if _find_label(nodes, adb, "export_chat"):
                 return True
+            time.sleep(1.0)
+        return _ask_export_label(adb, nodes)           # submenu up, label unknown in this language
     return False
 
 
 def _do_export(adb, media, emit_log, outer_stop, left):
     """Export the open chat, WITH media first, falling back to WITHOUT media only if WhatsApp
     rejects it ("Unable to export"). Sets media['mode']. Returns 'done' / 'fail' / 'stopped' /
-    'timeout'. On 'done' the Quick Share sheet is showing."""
+    'timeout' / 'blocked'. On 'done' the Quick Share sheet is showing."""
     def _stopped():
         return outer_stop is not None and outer_stop.is_set()
 
     def _open_and_tap_export():
         if not _open_export_menu(adb, stop=outer_stop, left=left):
             return False
-        return _tap_text(adb, "Export chat", timeout=12, match="contains", delay=1.2, stop=outer_stop)
+        end = time.time() + 12
+        while time.time() < end and not _stopped():
+            hit = _find_label(_nodes(adb), adb, "export_chat")
+            if hit:
+                adb.tap(*core.node_center(hit)); time.sleep(1.2)
+                return True
+            time.sleep(1.0)
+        return False
 
-    def _is_privacy_blocked():
+    def _is_privacy_blocked(n):
         # newer WhatsApp: "Advanced chat privacy" blocks export -> a "Can't export chats" dialog
-        n = _nodes(adb)
         return (core.find_node(n, "Can't export", "contains") is not None
                 or core.find_node(n, "Advanced chat privacy", "contains") is not None)
 
+    def _tap_ok():
+        ok = _notice_dialog(_nodes(adb))
+        if ok:
+            adb.tap(*core.node_center(ok)); time.sleep(0.8)
+        else:
+            _tap_text(adb, "OK", timeout=6, match="exact", delay=0.6, stop=outer_stop)
+
     def _skip_blocked():
         emit_log("Advanced Chat Privacy is ON for this chat - cannot export; skipping")
-        _tap_text(adb, "OK", timeout=6, match="exact", delay=0.6, stop=outer_stop)
+        _tap_ok()
         return "blocked"
+
+    def _media_choice(timeout=15):
+        """After 'Export chat': 'media' (the with/without question is up), 'blocked', or None."""
+        end = time.time() + timeout
+        while time.time() < end and not _stopped():
+            n = _nodes(adb)
+            if _is_privacy_blocked(n):
+                return "blocked"
+            if _media_dialog(n):
+                return "media"
+            if _notice_dialog(n):
+                return "blocked"            # a one-button notice instead of the media question
+            time.sleep(0.8)
+        return None
+
+    def _choose(which):
+        """Tap Include (0) / Without (1) media, re-tapping while the dialog lingers."""
+        for _ in range(3):
+            if _stopped():
+                return False
+            d = _media_dialog(_nodes(adb))
+            if d is None:
+                break                                   # tapped -> dialog gone, export proceeding
+            adb.tap(*core.node_center(d[which])); time.sleep(1.2)
+        return not _stopped()
 
     # --- attempt WITH media ---
     media["mode"] = "with media"
@@ -631,17 +858,11 @@ def _do_export(adb, media, emit_log, outer_stop, left):
     # Some chats have "Advanced chat privacy" ON, which BLOCKS export: a "Can't export chats"
     # dialog shows instead of the media choice. Detect it right away so we don't hang for minutes
     # waiting for a share sheet that will never appear.
-    if _wait_text(adb, "Can't export", timeout=4, match="contains", stop=outer_stop) or _is_privacy_blocked():
+    first = _media_choice()
+    if first == "blocked":
         return _skip_blocked()
-    # WAIT for the media-choice dialog to appear after "Export chat", THEN tap "Include media".
-    # (Don't assume it's instant - tapping too early / bailing early was leaving the export stuck.)
-    if _wait_text(adb, "Include media", timeout=15, match="contains", stop=outer_stop):
-        for _ in range(3):                              # re-tap if the choice dialog lingers
-            if _stopped():
-                return "stopped"
-            if core.find_node(_nodes(adb), "Include media", "contains") is None:
-                break                                   # tapped -> dialog gone, export proceeding
-            _tap_text(adb, "Include media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
+    if first == "media" and not _choose(0):
+        return "stopped"
     # branch: privacy-blocked | media-too-big | share sheet reached (by text OR foreground chooser)
     which = _wait_export_outcome(adb, timeout=max(5, min(300, left())), stop=outer_stop)
     if which == "qs":
@@ -654,16 +875,11 @@ def _do_export(adb, media, emit_log, outer_stop, left):
     # --- media rejected -> fall back to WITHOUT media ---
     media["mode"] = "without media"
     emit_log("media too big - falling back to Without media")
-    _tap_text(adb, "OK", timeout=10, match="exact", delay=0.8, stop=outer_stop)
+    _tap_ok()
     if not _open_and_tap_export():
         return "stopped" if _stopped() else ("timeout" if left() <= 0 else "fail")
-    if _wait_text(adb, "Without media", timeout=15, match="contains", stop=outer_stop):
-        for _ in range(3):
-            if _stopped():
-                return "stopped"
-            if core.find_node(_nodes(adb), "Without media", "contains") is None:
-                break
-            _tap_text(adb, "Without media", timeout=8, match="contains", delay=1.2, stop=outer_stop)
+    if _media_choice() == "media" and not _choose(1):
+        return "stopped"
     # share sheet reached? (text OR the foreground chooser, since the chooser is often unreadable)
     if _wait_export_outcome(adb, timeout=max(5, min(240, left())), stop=outer_stop) == "qs":
         return "done"
@@ -694,7 +910,7 @@ def _back_to_list(adb, tries=14):
         adb.key("BACK"); time.sleep(1.2)
     # last resort: bring WhatsApp back to the front (NOTE: this resets the list scroll)
     try:
-        adb.launch("com.whatsapp"); time.sleep(2.0)
+        adb.launch(wa_package(adb)); time.sleep(2.0)
     except core.AdbError:
         pass
     for _ in range(5):
@@ -752,8 +968,8 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     if reason != "done":
         _back_to_list(adb)
         return "fail-export", None, None, media["mode"]
-    key = f"{size[0]}x{size[1]}"
-    cached = _COORDS.get(key, {})
+    key = _coord_key(adb, size)
+    cached = _learned_coords(adb, size)
     blind = False                              # did we fall back to a learned position?
 
     # --- find & tap "Quick Share" ---
@@ -1092,9 +1308,11 @@ class WhatsAppBatch(threading.Thread):
     """
 
     def __init__(self, adb, case, size, names, order, emit, pause=None,
-                 pc_name=PC_NAME, save_dir=SAVE_DIR):
+                 pc_name=PC_NAME, save_dir=SAVE_DIR, package=None):
         super().__init__(daemon=True)
         self.adb, self.case, self.size = adb, case, size
+        if package:
+            adb.wa_package = package          # the WhatsApp app this run drives
         self.names = names                    # chats to export (subset, in order)
         self.order = order                    # full scanned order (for scroll direction)
         self.emit = emit
@@ -1104,7 +1322,7 @@ class WhatsAppBatch(threading.Thread):
         self.pc_name, self.save_dir = pc_name, save_dir
         self.files = {}                            # name -> (filename, sha256, media)
         self.times = {}                            # name -> ISO time the row became terminal
-        self.csv_path = str(Path(case.dir) / "exported_chats.csv")
+        self.csv_path = str(Path(case.dir) / csv_name(package))
         self.last_done = None
         self.results = []
 
@@ -1377,21 +1595,23 @@ def write_csv_atomic(path, rows, log=lambda m: None):
             pass
 
 
-def latest_csv_for_serial(cases_dir, serial):
+def latest_csv_for_serial(cases_dir, serial, package=None):
     """Find the most recent non-empty exported-chats CSV for THIS device. Case folders are named
     '<timestamp>_<device tag>' (older ones '<timestamp>_<serial>'). Side files saved while the CSV
     was locked ('exported_chats.unsaved-<stamp>.csv') count too, so the newest progress wins.
     Returns the path or None. This is how a restart on the SAME mobile continues the SAME CSV,
-    while a DIFFERENT mobile gets none and starts fresh."""
+    while a DIFFERENT mobile gets none and starts fresh. WhatsApp Business progress lives in its own
+    CSV (csv_name), so each app resumes only its own."""
     if not serial:
         return None
     import glob
     found = []
     for folder in {core.device_tag(serial), core.safe_name(serial)}:
-        pat = os.path.join(glob.escape(str(cases_dir)), f"*_{glob.escape(folder)}",
-                           "exported_chats*.csv")
-        found += [c for c in glob.glob(pat)
-                  if os.path.isfile(c) and os.path.getsize(c) > 0]
+        base = csv_name(package)[:-4]
+        for name in (base + ".csv", base + ".unsaved-*.csv"):
+            pat = os.path.join(glob.escape(str(cases_dir)), f"*_{glob.escape(folder)}", name)
+            found += [c for c in glob.glob(pat)
+                      if os.path.isfile(c) and os.path.getsize(c) > 0]
     if not found:
         return None
     return max(found, key=os.path.getmtime)
@@ -1443,9 +1663,11 @@ class RollingBatch(threading.Thread):
     """
 
     def __init__(self, adb, case, size, emit, pause=None, csv_path=None,
-                 pc_name=PC_NAME, save_dir=SAVE_DIR, resume_from=None, start_from=None):
+                 pc_name=PC_NAME, save_dir=SAVE_DIR, resume_from=None, start_from=None, package=None):
         super().__init__(daemon=True)
         self.adb, self.case, self.size, self.emit = adb, case, size, emit
+        if package:
+            adb.wa_package = package          # the WhatsApp app this run drives
         self._stop = threading.Event()
         self._pause = pause or threading.Event()
         self._runner = None       # current inner export runner
@@ -1455,7 +1677,7 @@ class RollingBatch(threading.Thread):
         self.times = {}           # name -> ISO time the row became terminal
         self.order = []           # discovery order
         self.pc_name, self.save_dir = pc_name, save_dir
-        self.csv_path = str(csv_path) if csv_path else str(Path(case.dir) / "exported_chats.csv")
+        self.csv_path = str(csv_path) if csv_path else str(Path(case.dir) / csv_name(package))
         self.resume_from = resume_from   # path to a prior CSV: skip its 'ok' chats, retry the rest
         self.start_from = start_from     # chat name to scroll to and begin at (skip everything above)
         self.only_names = None           # if set (a set of names), export ONLY these; skip others
