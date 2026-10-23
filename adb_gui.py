@@ -934,7 +934,7 @@ class App:
         self.dev_box.pack(side="left", padx=4)
         ttk.Button(top, text="Refresh", command=self.refresh_devices).pack(side="left")
         ttk.Button(top, text="Connect", command=self.connect).pack(side="left", padx=4)
-        ttk.Button(top, text="Contacts + WhatsApp JIDs → folder...",
+        ttk.Button(top, text="Contacts + WhatsApp JIDs → case folder",
                    command=self.extract_contacts_to_folder).pack(side="left", padx=4)
         ttk.Button(top, text="Reconstruct from backup (read-only)...",
                    command=self.reconstruct_backup).pack(side="left", padx=4)
@@ -1096,19 +1096,20 @@ class App:
         self._extract_contacts_async()        # once ADB is ready: pull contacts + WhatsApp JIDs
 
     def extract_contacts_to_folder(self):
-        """Button: pick a folder, then extract contacts.csv + whatsapp_contacts.csv into it."""
+        """Button: extract contacts.csv + whatsapp_contacts.csv (names with WhatsApp JIDs) into THIS
+        session's case folder, hashed in its hashes.csv - next to the chat CSV and exports."""
         if not self.adb:
             messagebox.showinfo("No device", "Connect a device first.")
             return
-        folder = filedialog.askdirectory(title="Choose a folder for the 2 contact files")
-        if not folder:
-            return
-        adb = self.adb
+        if not self.case:
+            self.case = CaseLog(CASE_DIR, self.serial or "unknown")
+        adb, case = self.adb, self.case
+        folder = str(case.dir)
 
         def work():
             try:
-                self._adblog(f"contacts: extracting into {folder} ...")
-                res = ce.extract_contacts(adb, folder, log=self._adblog)
+                self._adblog(f"contacts: extracting into the case folder {folder} ...")
+                res = ce.extract_contacts(adb, folder, log=self._adblog, case=case)
                 names = ", ".join(os.path.basename(f) for f in res["files"])
                 self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
                              f"{res['whatsapp']} WhatsApp contacts -> {names or '(no files)'}")
@@ -1146,7 +1147,8 @@ class App:
         include_media = messagebox.askyesno(
             "Include media?", "Include media (photos, videos, documents) in the reconstructed "
             "chats?\n\nYes = self-contained evidence but larger and slower.\nNo = text only (fast).")
-        out = filedialog.askdirectory(title="Choose an output folder for the reconstructed chats")
+        out = filedialog.askdirectory(title="Choose an output folder for the reconstructed chats",
+                                      initialdir=str(self.case.dir) if self.case else None)
         if not out:
             return
 
