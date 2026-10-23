@@ -380,7 +380,7 @@ class TestChainOfCustody(unittest.TestCase):
         digest = case.record_file(f, "whatsapp export (with media) via Quick Share")
         rows = (case.dir / "hashes.csv").read_text(encoding="utf-8")
         self.assertIn(digest, rows)
-        self.assertIn(str(f), rows)
+        self.assertIn(str(f.resolve()), rows)      # the full path (never a short 8.3 alias)
         self.assertIn(digest, (case.dir / "session.log").read_text(encoding="utf-8"))
 
 
