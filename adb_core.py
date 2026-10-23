@@ -639,7 +639,10 @@ class CaseLog:
 
     def record_file(self, path: Path, note: str = "") -> str:
         digest = sha256_file(path)
-        rel = Path(path).relative_to(self.dir).as_posix()
+        try:
+            rel = Path(path).resolve().relative_to(self.dir.resolve()).as_posix()
+        except ValueError:          # e.g. a Quick Share export saved outside the case folder
+            rel = str(Path(path).resolve())
         with self._lock, open(self.hash_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([now_iso(), rel, Path(path).stat().st_size, digest, note])
         self.write(f"saved {rel} sha256={digest}")

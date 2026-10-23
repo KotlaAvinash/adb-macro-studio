@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 
 # Google Quick Share for Windows. Starting it again while it runs in the tray just brings its
@@ -77,6 +78,89 @@ def _open_quick_share_window(log):
     return False
 
 
+def _click_accept(qs_windows, labels, log):
+    for w in qs_windows:
+        ctrl = _accept_control(w, labels)
+        if ctrl is None:
+            continue
+        try:
+            try:
+                ctrl.invoke()
+            except Exception:
+                ctrl.click_input()
+            log("clicked Accept in the Quick Share window")
+            return True
+        except Exception:
+            pass
+    return False
+
+
+class AcceptWatcher:
+    """ONE background watcher for a whole batch run (instead of a new 180-second UI-polling thread
+    per chat attempt, which piled up on failures/retries and loaded the PC on long runs). It only
+    clicks while ARMED - from the moment we send a chat until it is received - so a transfer from
+    some other nearby device outside that window is never auto-accepted."""
+
+    def __init__(self, log=lambda m: None, labels=ACCEPT_LABELS, poll=0.4):
+        self.log, self.labels, self.poll = log, tuple(_lc(x) for x in labels), poll
+        self._until = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._opened = self._off = False
+
+    def arm(self, seconds):
+        with self._lock:
+            self._until = time.time() + seconds
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="qs-accept")
+            self._thread.start()
+
+    def disarm(self):
+        with self._lock:
+            self._until = 0.0
+
+    def armed(self):
+        return time.time() < self._until
+
+    def stop(self):
+        self.disarm()
+        self._stop.set()
+
+    def poll_once(self):
+        """One look for an Accept button (only while armed). True if it clicked."""
+        if not self.armed() or self._off:
+            return False
+        try:
+            from pywinauto import Desktop
+        except Exception as e:  # pragma: no cover
+            self._off = True
+            self.log(f"AUTO-ACCEPT OFF: pywinauto could not load ({e}). If you installed it while this "
+                     "app was running, RESTART the app; otherwise run 'pip install pywinauto'. "
+                     "Until then, click Accept on the PC yourself.")
+            return False
+        try:
+            wins = Desktop(backend="uia").windows()
+        except Exception:
+            wins = []
+        qs_windows = [w for w in wins if _is_quick_share_window(w)]
+        if not qs_windows and not self._opened:
+            self._opened = True
+            _open_quick_share_window(self.log)
+        if _click_accept(qs_windows, self.labels, self.log):
+            self.disarm()
+            return True
+        return False
+
+    def _run(self):
+        while not self._stop.is_set():
+            if self.armed():
+                self.poll_once()
+                self._stop.wait(self.poll)
+            else:
+                self._stop.wait(0.3)
+
+
 def accept_quickshare(timeout=45, poll=0.4, log=lambda m: None, labels=ACCEPT_LABELS) -> bool:
     """Wait up to `timeout`s for the Quick Share Accept control and click it. True if clicked."""
     labels = tuple(_lc(x) for x in labels)
@@ -100,19 +184,8 @@ def accept_quickshare(timeout=45, poll=0.4, log=lambda m: None, labels=ACCEPT_LA
         if not qs_windows and not opened:
             opened = True
             _open_quick_share_window(log)
-        for w in qs_windows:
-            ctrl = _accept_control(w, labels)
-            if ctrl is None:
-                continue
-            try:
-                try:
-                    ctrl.invoke()
-                except Exception:
-                    ctrl.click_input()
-                log("clicked Accept in the Quick Share window")
-                return True
-            except Exception:
-                pass
+        if _click_accept(qs_windows, labels, log):
+            return True
         if not reported and time.time() - start > 5:
             reported = True          # one diagnostic, without recording other apps' window titles
             log("Quick Share auto-accept: " + (

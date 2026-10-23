@@ -357,14 +357,14 @@ class TestRunResilience(unittest.TestCase):
         b._ensure_list = lambda: True
         b._recover_screen = lambda: True
 
-        def boom(adb):
+        def boom(nodes):                      # the walk's per-page read of the chat rows
             calls["n"] += 1
             if calls["n"] <= 3:
                 raise ValueError("synthetic")
             b._stop.set()
             return []
         with mock.patch.object(wb, "time", FakeClock()), \
-                mock.patch.object(wb, "visible_chats", boom), \
+                mock.patch.object(wb, "_chat_rows", boom), \
                 mock.patch.object(wb, "keep_awake", lambda *a, **k: None), \
                 mock.patch.object(wb, "pc_keep_awake", lambda *a, **k: None), \
                 mock.patch.object(wb, "dismiss_anr", lambda adb: False), \

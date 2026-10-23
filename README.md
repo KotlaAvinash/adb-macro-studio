@@ -18,6 +18,33 @@ There is also a **headless CLI** (`adb_cli.py`) for machines with no display.
 > 📄 For how the WhatsApp batch exporter guarantees a **complete, non-duplicated, verifiable**
 > collection (and what to watch for in the field), see **[docs/RELIABILITY.md](docs/RELIABILITY.md)**.
 
+## Screenshots
+
+All screenshots use **made-up sample data** (invented chat names, a dummy device code and PC name),
+and every field that would hold real case data — device, PC name, save folder, chat names, file
+paths in the log — is additionally **blurred**.
+
+**How an export travels** — the phone exports a chat, the tool drives WhatsApp over USB, and the
+file goes straight from the phone to this PC over Quick Share (offline). Everything for one session
+ends up in one case folder.
+
+![How one chat export travels from the phone to the case folder](docs/images/how_it_works.svg)
+
+**The WhatsApp export window** — the green **Scan + Export all chats** button is the main action
+(no separate scan needed). *Export selected* and *Export one chat…* export just those chats. The
+Status column shows each chat's result as it happens: `ok` (received and hashed),
+`blocked-privacy` (WhatsApp's Advanced Chat Privacy forbids export), `running`, `pending`, or a
+`fail-…` reason. Settings holds the PC's Quick Share name, the folder Quick Share saves to, and which
+app to export (WhatsApp or WhatsApp Business).
+
+![The WhatsApp export window during a run, with chat names blurred](docs/images/batch_export.png)
+
+**The main window** — pick and connect the phone, extract contacts with their WhatsApp IDs,
+rebuild chats from a backup (read-only), and record/replay tap macros. The green **WhatsApp
+export…** button (top right) opens the export window above.
+
+![The main window, with device details blurred](docs/images/main_window.png)
+
 > ⚠️ **Use responsibly.** Only use this on devices you own or are explicitly authorized to
 > access. Enabling USB debugging and sending input events modifies device state; in a
 > forensic context, document what you do. This project is provided as-is under the MIT license.
@@ -262,9 +289,10 @@ isn't available.
   (`Android/media/com.whatsapp.w4b/WhatsApp Business`).
 
 ### How the rolling export works
-It does **not** pre-scan the whole list. Instead it reads the chats currently on screen, exports
-the ones not done yet, scrolls down, and repeats to the bottom — so it starts working immediately
-and survives lists of hundreds of chats. Per chat it:
+Click **Scan + Export all chats**. It does **not** pre-scan the whole list: it goes to the very top
+of the chat list (with the **All** filter tab on, so no Unread/Groups tab hides chats), exports the
+chats on screen, scrolls one page and repeats to the bottom — then does the same for the **Archived
+chats** — and finally gives every chat that failed **one more attempt**. Per chat it:
 
 1. Opens the chat and exports it, **trying "with media" first** and automatically falling back to
    **"without media"** if WhatsApp says the export is too large.
@@ -272,26 +300,42 @@ and survives lists of hundreds of chats. Per chat it:
    folder, and records its **SHA-256**.
 3. Writes a row to the CSV, then moves to the next chat.
 
-**Buttons:** *Scan* (see what's on screen), *Auto* (rolling scan+export), *Pause/Resume*,
-*Resume pending* (retry rows still pending or failed), *Save CSV*, and *Stop* (halts within a few
-seconds — it also interrupts an in-progress export).
+**Buttons:** *Scan + Export all chats* (the main action), *Export selected*, *Export one chat…*,
+*Scan only* (just list the chats, saved to the case folder), *Pause/Resume*, *Retry pending /
+failed*, *Save list to CSV*, and *Stop* (halts within a few seconds — it also interrupts an
+in-progress export).
 
-**Export only selected chats:** *Scan* to list the chats, **select the ones you want** in the
-list, then click *Auto* — it exports only the selected chats and marks the rest `skipped`. (With
-nothing selected, *Auto* exports everything.) The separate *Export selected* button also works.
+**Export only some chats:** *Scan only* lists every chat (main list + Archived); **select the ones
+you want** and click *Export selected* — the rest are marked `skipped`. To redo **one** chat (e.g. one
+that failed), click *Export one chat…* and type its name: it finds the chat in the list or in
+Archived, exports it, and stops. A chat you choose is exported even if an earlier run already got it.
+
+**Scrolling on any phone:** the list is scrolled by its own measured rows (not fixed screen
+fractions), and after each page the tool checks the last chat it saw is still on screen — so no chat
+is skipped on any screen size, display density, font size or brand. Before tapping a chat it waits
+for the list to stop moving, and after opening it checks the chat's title, so a wrong chat is never
+exported under another chat's name.
+
+### Everything in one case folder
+Each session (each **Connect**) gets its own case folder, and everything for that session is saved
+there: `contacts.csv` and `whatsapp_contacts.csv` (names with their WhatsApp IDs), the scanned chat
+list, **`exported_chats.csv`**, a **verified copy of every received export** under `exports/`, and
+`hashes.csv` + `session.log` (SHA-256 of every file). When a run continues an earlier session's
+progress, the earlier CSV is only **read** (its finished chats are skipped) and left untouched.
 
 ### Resume after an interruption (lock / crash / disconnect)
 So you never have to redo work if the phone locks or the run stops midway:
-- **Resume from CSV…** — pick a previous run's `exported_chats.csv`. Chats already `ok` are
+- **Continue from a CSV…** — pick a previous run's `exported_chats.csv`. Chats already `ok` are
   **skipped**; everything else (failed / pending / never-reached) is **re-queued and retried**.
+  Without picking one, the phone's last session is continued automatically.
 - **Start from chat** — type a chat name and the run scrolls to it and **begins there** (chats
   above it are marked `skipped`). Handy to pick up exactly where it stopped.
 - The run also **keeps the screen awake** and, if the screen locks or the device drops, it **wakes
   it, re-arms stay-on, and returns to the chat list** before continuing.
 
-> Note on missed chats: the batch *prevents* skips with generous page overlap rather than
-> detecting them after the fact — a chat that was ever scrolled past unread simply wouldn't appear
-> in the CSV. Resume + a re-scan is the way to be certain every chat is captured.
+> Note on missed chats: every page move is verified (the last chat seen must still be on screen
+> afterwards), the ends of the list are confirmed by scrolling the other way and back, and the
+> Archived chats are included — so a chat can't be scrolled past unread.
 
 ### Skip chats that take too long
 Some very large chats make the phone too busy for the screen-reader (Android can even kill the
