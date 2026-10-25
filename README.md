@@ -116,7 +116,7 @@ When the app starts, the **Log box** shows the adb it picked (e.g. `adb: D:\tool
 
 Download the ZIP from GitHub (green **Code → Download ZIP**) and extract it, **or** clone:
 ```bash
-git clone https://github.com/whitedevil1026/adb-macro-studio.git
+git clone https://github.com/KotlaAvinash/adb-macro-studio.git
 cd adb-macro-studio
 ```
 
