@@ -22,7 +22,9 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import zipfile
+import zlib
 
 # ---- WhatsApp export line formats ---------------------------------------------------------
 # iOS:     [06/09/2024, 10:30:45] John Doe: message
@@ -166,6 +168,52 @@ def _zip_policy_violation(zf):
     return None
 
 
+_UNSAFE_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_media_name(name):
+    """A filename safe on every OS: no path separators / Windows-reserved characters, and no trailing
+    dots or spaces (Windows silently strips those, which can make two names collide)."""
+    s = _UNSAFE_NAME.sub("_", os.path.basename(name or "")).rstrip(". ")
+    return s or "file"
+
+
+def _member_matches(dest, info):
+    """True only if `dest` already holds EXACTLY this ZIP member (same size and CRC-32). Existence
+    alone is not enough: a file left by an earlier build - another chat's, or one cut short by a
+    full disk - must not be reused as this attachment."""
+    try:
+        if os.path.getsize(dest) != info.file_size:
+            return False
+        crc = 0
+        with open(dest, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                crc = zlib.crc32(chunk, crc)
+        return (crc & 0xFFFFFFFF) == info.CRC
+    except OSError:
+        return False
+
+
+def _extract_member(zf, member, dest, info):
+    """Extract one member to `dest` via a private temporary file, verify its length (the ZIP reader
+    verifies the CRC as it reads), then atomically publish it. A failed write never leaves a partial
+    file under the final name."""
+    tmp = f"{dest}.part-{os.getpid()}-{os.urandom(3).hex()}"
+    try:
+        with zf.open(member) as src, open(tmp, "wb") as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                dst.write(chunk)
+        if os.path.getsize(tmp) != info.file_size:
+            raise OSError(f"{member}: wrote {os.path.getsize(tmp)} of {info.file_size} bytes")
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
     """Return a chat dict {name, messages, ...} from one export zip, or None if it has no chat.
     mode="embed": media as base64 data URIs (single-file output).
@@ -191,13 +239,19 @@ def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
     msgs = parse_chat_text(text, {os.path.basename(n) for n in names
                                   if not n.lower().endswith(".txt") and os.path.basename(n)})
 
-    out_dir = None
+    out_dir = ns = None
     if mode == "folder":
-        out_dir = os.path.join(media_root, str(idx))
+        # media folder named by the archive's CONTENT (its SHA-256), not its position in the input
+        # list: adding/removing/renaming/reordering zips can no longer point one chat at another
+        # chat's folder, and identical content may safely reuse what is already there.
+        ns = _sha256(path)[:16]
+        out_dir = os.path.join(media_root, ns)
         os.makedirs(out_dir, exist_ok=True)
 
-    # index media files in the zip by basename
+    # index media files in the zip by basename; remember each member's position so its physical
+    # file name is unique even when two names differ only in case ('photo.jpg' / 'PHOTO.jpg')
     files = {os.path.basename(n): n for n in names if not n.lower().endswith(".txt")}
+    position = {n: i for i, n in enumerate(names)}
     used, embedded, skipped, embed_bytes = set(), 0, 0, 0
     for mo in msgs:
         media = []
@@ -209,16 +263,13 @@ def load_zip(path, max_bytes, mode="embed", media_root=None, idx=0):
                 info = zf.getinfo(inzip)
                 item["size"] = info.file_size
                 if mode == "folder":
-                    # extract to media/<idx>/<basename> and reference by relative path (ALL media)
-                    dest = os.path.join(out_dir, ref)
-                    if not os.path.exists(dest):
-                        with zf.open(inzip) as src, open(dest, "wb") as dst:
-                            while True:
-                                chunk = src.read(1 << 20)
-                                if not chunk:
-                                    break
-                                dst.write(chunk)
-                    item["src"] = f"media/{idx}/{ref}"
+                    # media/<archive-hash>/<member#>_<name>: reused only if it already holds this
+                    # exact member (size + CRC); otherwise (re)extracted via a verified temp file
+                    phys = f"{position[inzip]:04d}_{_safe_media_name(ref)}"
+                    dest = os.path.join(out_dir, phys)
+                    if not _member_matches(dest, info):
+                        _extract_member(zf, inzip, dest, info)
+                    item["src"] = f"media/{ns}/{urllib.parse.quote(phys)}"
                     embedded += 1
                     embed_bytes += info.file_size
                 elif max_bytes == 0 or info.file_size <= max_bytes:
@@ -274,10 +325,15 @@ def build(folder, out_path, max_embed_mb, owner, mode="embed"):
         media_root = os.path.join(os.path.dirname(os.path.abspath(out_path)), "media")
         os.makedirs(media_root, exist_ok=True)
     print(f"Building viewer ({mode} mode) from {len(zips)} zip(s) in {folder}")
-    chats = []
+    chats, failed = [], []
     for i, z in enumerate(zips):
         print(f"- {os.path.basename(z)}")
-        c = load_zip(z, max_bytes, mode=mode, media_root=media_root, idx=i)
+        try:
+            c = load_zip(z, max_bytes, mode=mode, media_root=media_root, idx=i)
+        except Exception as e:                   # one damaged archive must not lose the others
+            print(f"  FAILED {os.path.basename(z)}: {e}")
+            failed.append((os.path.basename(z), str(e)))
+            continue
         if c:
             chats.append(c)
     if not chats:
@@ -292,8 +348,10 @@ def build(folder, out_path, max_embed_mb, owner, mode="embed"):
     payload = (payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
                       .replace("</", "<\\/"))
     htmldoc = HTML_TEMPLATE.replace("/*__DATA__*/", "window.__CHATS__ = " + payload + ";")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(htmldoc)
+    tmp_html = f"{out_path}.part-{os.getpid()}"
+    with open(tmp_html, "w", encoding="utf-8") as f:     # publish the page in one step, so a
+        f.write(htmldoc)                                 # failed write never leaves half a page
+    os.replace(tmp_html, out_path)
     total_embed = sum(c["embed_bytes"] for c in chats)
     total_skip = sum(c["skipped"] for c in chats)
     size = os.path.getsize(out_path)
@@ -307,6 +365,11 @@ def build(folder, out_path, max_embed_mb, owner, mode="embed"):
               f"({total_embed/1e6:.1f} MB)  media too-large-skipped={total_skip}")
     if size > 800e6:
         print("WARNING: the HTML is very large and may be slow to open. Lower --max-embed-mb.")
+    if failed:
+        print(f"\nINCOMPLETE: {len(failed)} archive(s) could not be read and are NOT in this viewer:")
+        for name, why in failed:
+            print(f"  - {name}: {why}")
+        return 2
     return 0
 
 

@@ -23,11 +23,15 @@ investigator's procedure decides which is acceptable.
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import unicodedata
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,70 +90,130 @@ def newest_backup(adb, package="com.whatsapp"):
 
 
 def pull_backup(adb, dest_dir, emit=print, package="com.whatsapp"):
-    """adb pull the newest backup to dest_dir. Returns (local_path, sha256) or (None, None)."""
+    """adb pull the newest backup into a NEW acquisition folder under dest_dir (never onto an earlier
+    pull of the same file). Returns (local_path, sha256) or (None, None)."""
     remote = newest_backup(adb, package)
     if not remote:
         emit("no msgstore backup found on the phone (is WhatsApp installed / has it ever backed up?)")
         return None, None
-    os.makedirs(dest_dir, exist_ok=True)
-    emit(f"pulling backup (read-only): {remote}")
-    adb.pull(remote, Path(dest_dir))
-    local = os.path.join(dest_dir, remote.rsplit("/", 1)[-1])
+    acq = bt.new_acquisition_dir(dest_dir, "backup")
+    emit(f"pulling backup (read-only): {remote} -> {os.path.basename(acq)}")
+    adb.pull(remote, Path(acq))
+    local = os.path.join(acq, remote.rsplit("/", 1)[-1])
     if not os.path.isfile(local):
         emit("adb pull did not produce the backup file")
         return None, None
     digest = bt.sha256(local)
-    emit(f"pulled {os.path.basename(local)} ({os.path.getsize(local)} bytes) sha256={digest[:16]}...")
+    emit(f"pulled {os.path.basename(local)} ({os.path.getsize(local)} bytes) sha256={digest}")
     return local, digest
 
 
 def pull_media(adb, dest_dir, emit=print, package="com.whatsapp"):
-    """adb pull the whole Media tree (can be large). Returns the local Media dir, or None."""
+    """adb pull the whole Media tree (can be large) into a NEW acquisition folder under dest_dir.
+    Returns the local Media dir, or None."""
     base = wa_dir(adb, package)
     if not base:
         return None
-    os.makedirs(dest_dir, exist_ok=True)
-    emit(f"pulling media (read-only, may be large): {base}/Media")
-    adb.pull(base + "/Media", Path(dest_dir))
-    local = os.path.join(dest_dir, "Media")
+    acq = bt.new_acquisition_dir(dest_dir, "media")
+    emit(f"pulling media (read-only, may be large): {base}/Media -> {os.path.basename(acq)}")
+    adb.pull(base + "/Media", Path(acq))
+    local = os.path.join(acq, "Media")
     return local if os.path.isdir(local) else None
 
 
 # --------------------------------------------------------------------------- decrypt
-def _rm(path):
+_HEX_KEY = re.compile(r"\b[0-9a-fA-F]{64}\b")
+
+
+def _redact_keys(text):
+    """Never forward a 64-hex backup key from decryptor output into logs."""
+    return _HEX_KEY.sub("<key redacted>", text or "")
+
+
+def _ro_uri(path):
+    """A read-only SQLite URI for `path` with the filename correctly percent-encoded - a plain
+    f'file:{path}' treats a '#' or '?' in a valid Windows filename as URI syntax."""
+    return Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+
+
+def _looks_like_msgstore(path):
+    """True if `path` opens as SQLite and has WhatsApp's message table (modern or legacy)."""
     try:
-        if path and os.path.isfile(path):
-            os.remove(path)
-    except OSError:
-        pass
+        con = sqlite3.connect(_ro_uri(path), uri=True)
+        try:
+            names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return bool(names & {"message", "messages"})
+
+
+def _publish(src, directory, filename):
+    """Move `src` to a name in `directory` that is NOT already taken and return it. Uses a hard link
+    (fails if the target exists) so an existing file can never be replaced, even in a race; falls
+    back to rename on filesystems without hard links."""
+    while True:
+        dest = _unique_path(directory, filename)
+        try:
+            os.link(src, dest)
+            os.remove(src)
+            return dest
+        except FileExistsError:
+            continue
+        except OSError:
+            if os.path.exists(dest):
+                continue
+            os.rename(src, dest)
+            return dest
 
 
 def decrypt_backup(crypt_path, key, out_db, emit=print, decrypt_timeout=1800):
     """Decrypt msgstore.db.crypt1x with wa-crypt-tools. `key` is a 64-hex string or a key file path.
-    Returns out_db on success, else None. A hung decryptor can't stall the workflow forever
-    (decrypt_timeout, default 30 min); a failed/timed-out run leaves no partial output."""
+
+    Returns the path of the NEW decrypted database, or None. `out_db` names the wanted file, but an
+    existing file there is NEVER touched: the result is published as 'msgstore (1).db' etc. The
+    decryptor writes into a private temporary folder owned by this attempt, the result is checked to
+    be a WhatsApp database, and on failure, launch error or timeout (decrypt_timeout, default
+    30 min) ONLY that temporary folder is removed - an earlier decrypted database is never deleted.
+    """
     try:
         import wa_crypt_tools  # noqa: F401
     except Exception:
         emit("wa-crypt-tools is not installed (pip install wa-crypt-tools) - cannot decrypt")
         return None
-    cmd = [sys.executable, "-m", "wa_crypt_tools.wadecrypt", key, crypt_path, out_db]
+    if os.path.abspath(crypt_path) == os.path.abspath(out_db):
+        emit("refusing to decrypt: the output would overwrite the input backup")
+        return None
+    out_dir = os.path.dirname(os.path.abspath(out_db))
+    os.makedirs(out_dir, exist_ok=True)
+    work = tempfile.mkdtemp(prefix=".decrypt-", dir=out_dir)       # owned by this attempt only
+    tmp_db = os.path.join(work, "msgstore.db")
+    cmd = [sys.executable, "-m", "wa_crypt_tools.wadecrypt", key, crypt_path, tmp_db]
     emit("decrypting backup...")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=decrypt_timeout)
-    except subprocess.TimeoutExpired:
-        emit(f"decrypt timed out after {decrypt_timeout}s - aborting")
-        _rm(out_db)                                # never leave a partial/ambiguous output
-        return None
-    if r.returncode != 0 or not os.path.isfile(out_db):
-        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
-        emit("decrypt failed: " + " | ".join(tail))
-        emit("  (a wrong key shows 'MAC check failed'; a corrupt/partial backup fails the same way)")
-        _rm(out_db)
-        return None
-    emit(f"decrypted -> {os.path.basename(out_db)}")
-    return out_db
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=decrypt_timeout)
+        except subprocess.TimeoutExpired:
+            emit(f"decrypt timed out after {decrypt_timeout}s - aborting (nothing published)")
+            return None
+        except OSError as e:
+            emit(f"could not start the decryptor: {e}")
+            return None
+        if r.returncode != 0 or not os.path.isfile(tmp_db):
+            tail = _redact_keys((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-3:]
+            emit("decrypt failed: " + " | ".join(tail))
+            emit("  (a wrong key shows 'MAC check failed'; a corrupt/partial backup fails the same way)")
+            return None
+        if not _looks_like_msgstore(tmp_db):
+            emit("decrypt produced a file that is not a WhatsApp database - not published")
+            return None
+        final = _publish(tmp_db, out_dir, os.path.basename(out_db))
+        emit(f"decrypted -> {os.path.basename(final)} sha256={bt.sha256(final)}")
+        return final
+    finally:
+        shutil.rmtree(work, ignore_errors=True)     # only this attempt's temp folder
 
 
 # --------------------------------------------------------------------------- reconstruct
@@ -240,7 +304,7 @@ def reconstruct(db_path, media_root, out_dir, contacts=None, owner="Me",
     `media_root` is the pulled Media dir (or the WhatsApp dir containing Media); None = text only.
     `only_numbers` limits to those phone numbers (digits). Returns a list of per-chat manifest dicts."""
     os.makedirs(out_dir, exist_ok=True)
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = sqlite3.connect(_ro_uri(db_path), uri=True)
     cur = con.cursor()
     res = _Resolver(cur, contacts)
     media = _media_index(cur)
@@ -257,6 +321,7 @@ def reconstruct(db_path, media_root, out_dir, contacts=None, owner="Me",
 
     only = {re.sub(r"\D", "", n) for n in only_numbers} if only_numbers else None
     mroot = _resolve_media_root(media_root)
+    locator = _MediaLocator(mroot) if mroot else None     # one name index for the whole run
 
     # stream all messages grouped by chat (ordered), flush one .zip per chat
     q = """SELECT _id, chat_row_id, from_me, sender_jid_row_id, timestamp, message_type, text_data
@@ -273,7 +338,7 @@ def reconstruct(db_path, media_root, out_dir, contacts=None, owner="Me",
         is_group = (jrid is not None and res.is_group(jrid))
         title = chat_subject.get(cid) or (res.display(jrid) if jrid is not None else f"chat {cid}")
         m = _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, owner,
-                            copy_media, emit)
+                            copy_media, emit, locator=locator)
         if m:
             manifests.append(m)
 
@@ -290,18 +355,37 @@ def reconstruct(db_path, media_root, out_dir, contacts=None, owner="Me",
     # record of a prior collection), and write it atomically so a crash can't leave it half-written.
     man_csv = _unique_path(out_dir, "backup_chats.csv")
     rows_out = [["#", "chat", "number", "is_group", "messages", "rows", "media",
+                 "media_files", "media_copied", "media_missing", "media_errors",
                  "first_utc", "last_utc", "first_ms", "last_ms", "zip", "sha256"]]
     for i, m in enumerate(sorted(manifests, key=lambda x: x["last_ms"] or 0, reverse=True), 1):
         rows_out.append([i, m["title"], m["number"], int(m["is_group"]), m["messages"], m["rows"],
-                         m["media"], m["first_utc"], m["last_utc"], m["first_ms"], m["last_ms"],
-                         m["zip"], m["sha256"]])
-    tmp = man_csv + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows_out)
-    os.replace(tmp, man_csv)
+                         m["media"], m["media_files"], m["media_copied"], m["media_missing"],
+                         m["media_errors"], m["first_utc"], m["last_utc"], m["first_ms"],
+                         m["last_ms"], m["zip"], m["sha256"]])
+    _write_rows_atomic(man_csv, rows_out)
+    # per-attachment record: which message referenced which source file, under which name inside
+    # the zip, and whether it was copied (with its SHA-256), missing, ambiguous or failed.
+    att_rows = [a for m in manifests for a in m["attachments"]]
+    att_csv = None
+    if att_rows:
+        att_csv = _unique_path(out_dir, "backup_attachments.csv")
+        _write_rows_atomic(att_csv, [["zip", "message_row_id", "source_path", "name_in_zip",
+                                      "status", "sha256"]] + [list(a) for a in att_rows])
+    missing = sum(m["media_missing"] for m in manifests)
+    errors = sum(m["media_errors"] for m in manifests)
     emit(f"reconstructed {len(manifests)} chats -> {out_dir} "
-         f"(manifest: {os.path.basename(man_csv)} sha256={bt.sha256(man_csv)[:16]}...)")
+         f"(manifest: {os.path.basename(man_csv)} sha256={bt.sha256(man_csv)})")
+    if copy_media and mroot and (missing or errors):
+        emit(f"media: {missing} attachment file(s) missing or ambiguous, {errors} copy error(s) - "
+             f"see {os.path.basename(att_csv)}")
     return manifests
+
+
+def _write_rows_atomic(path, rows):
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    os.replace(tmp, path)
 
 
 def _unique_path(directory, filename):
@@ -327,12 +411,39 @@ def _resolve_media_root(media_root):
     return media_root
 
 
+def _archive_name(rel, base, taken):
+    """A member name for ONE source file. It keeps its own file name unless a DIFFERENT source in the
+    same chat already uses that name - compared Unicode-normalised and case-insensitively, so the
+    names also stay distinct when extracted on Windows - in which case a short hash of its source
+    path is appended: 'IMG-1~3f2a9c1b.jpg'. Two different files can no longer collapse into one."""
+    name = os.path.basename(base or "") or "attachment"
+    key = unicodedata.normalize("NFC", name).lower()
+    if key in taken:
+        stem, ext = os.path.splitext(name)
+        h = hashlib.sha1((rel or name).encode("utf-8", "replace")).hexdigest()
+        for n in range(8, 41, 4):
+            name = f"{stem}~{h[:n]}{ext}"
+            key = unicodedata.normalize("NFC", name).lower()
+            if key not in taken:
+                break
+        else:
+            i = 2
+            while key in taken:
+                name = f"{stem}~{h}-{i}{ext}"
+                key = unicodedata.normalize("NFC", name).lower()
+                i += 1
+    taken.add(key)
+    return name
+
+
 def _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, owner,
-                    copy_media, emit):
-    lines, attach = [], []
+                    copy_media, emit, locator=None):
+    lines = []
+    sources = {}                                  # source rel path -> (archive name, base)
+    taken = set()
+    refs = []                                     # (message_row_id, source rel path)
     first_ms = last_ms = None
     emitted = 0                                   # messages actually RENDERED into _chat.txt
-    nmed = 0
     for _id, _cid, from_me, sender_rid, ts, mtype, text in rows:
         dt = _ts_utc(ts)
         if dt is None:
@@ -343,11 +454,12 @@ def _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, o
         mi = media.get(_id)
         if mi:
             base, rel, caption = mi
-            lines.append(f"{stamp} {who}: {_LTR}<attached: {base}>")
+            if rel not in sources:                # the same source file referenced again keeps
+                sources[rel] = (_archive_name(rel, base, taken), base)   # the same archive name
+            lines.append(f"{stamp} {who}: {_LTR}<attached: {sources[rel][0]}>")
             if caption or body:
                 lines.append(caption or body)
-            attach.append((base, rel))
-            nmed += 1
+            refs.append((_id, rel))
         elif body:
             lines.append(f"{stamp} {who}: {body}")
         else:
@@ -368,30 +480,41 @@ def _write_chat_zip(out_dir, title, number, is_group, rows, res, media, mroot, o
     while os.path.exists(zip_path):               # never overwrite existing evidence
         zip_path = os.path.join(out_dir, f"{prefix} ({n}).zip")
         n += 1
+    outcome = {}                                  # source rel path -> (status, sha256 of source)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("_chat.txt", "\n".join(lines) + "\n")
-        if copy_media and mroot:
-            seen = set()
-            for base, rel in attach:
-                if base in seen:
-                    continue
-                src = _find_media_file(mroot, rel, base)
-                if src:
-                    try:
-                        z.write(src, base)
-                        seen.add(base)
-                    except Exception:
-                        pass
+        for rel, (arch, base) in sources.items():
+            if not (copy_media and mroot):
+                outcome[rel] = ("not acquired (text only)", "")
+                continue
+            src, how = (locator or _MediaLocator(mroot)).locate(rel, base)
+            if not src:
+                outcome[rel] = (how, "")          # 'missing' or 'ambiguous name' - never guessed
+                continue
+            try:
+                z.write(src, arch)
+                outcome[rel] = ("copied" if how == "found" else "copied (" + how + ")",
+                                bt.sha256(src))
+            except Exception as e:
+                outcome[rel] = (f"copy error: {e}", "")
+
     def _iso(ms):
         d = _ts_utc(ms)
         return d.strftime("%Y-%m-%dT%H:%M:%SZ") if d else ""
+    statuses = [s for s, _h in outcome.values()]
+    zname = os.path.basename(zip_path)
     return {"title": title, "number": number, "is_group": is_group,
             "messages": emitted,                  # RENDERED messages, matches _chat.txt
             "rows": len(rows),                    # raw DB rows for this chat (incl. system/empty)
-            "media": nmed,
+            "media": len(refs),                   # attachment REFERENCES in the transcript
+            "media_files": len(sources),          # distinct source files referenced
+            "media_copied": sum(1 for s in statuses if s.startswith("copied")),
+            "media_missing": sum(1 for s in statuses if s in ("missing", "ambiguous name")),
+            "media_errors": sum(1 for s in statuses if s.startswith("copy error")),
+            "attachments": [(zname, mid, rel, sources[rel][0]) + outcome[rel] for mid, rel in refs],
             "first_utc": _iso(first_ms), "last_utc": _iso(last_ms),
             "first_ms": first_ms or "", "last_ms": last_ms or "",   # raw source epoch, never lost
-            "zip": os.path.basename(zip_path), "sha256": bt.sha256(zip_path)}
+            "zip": zname, "sha256": bt.sha256(zip_path)}
 
 
 def _within(root, path):
@@ -406,26 +529,47 @@ def _within(root, path):
         return False
 
 
+class _MediaLocator:
+    """Finds the file behind an attachment. The stored path (message_media.file_path) is UNTRUSTED
+    database content: absolute paths and '..' are rejected and the result must stay inside the media
+    root. If the exact path is absent, a file is used by NAME only when exactly ONE file under Media
+    has that name; several matches are 'ambiguous name' and are never guessed (a basename guess
+    could attach a different person's photo). The name index is built once per reconstruction, not
+    one folder walk per attachment."""
+
+    def __init__(self, mroot):
+        self.mroot = mroot
+        self._index = None
+
+    def _build(self):
+        idx = {}
+        mediadir = os.path.join(self.mroot, "Media")
+        for root, _dirs, files in os.walk(mediadir if os.path.isdir(mediadir) else self.mroot):
+            for f in files:
+                idx.setdefault(f, []).append(os.path.join(root, f))
+        self._index = idx
+
+    def locate(self, rel, base):
+        """(path, 'found' | 'found by name') or (None, 'missing' | 'ambiguous name')."""
+        rel = (rel or "").replace("\\", "/")
+        if rel and not rel.startswith("/") and ".." not in rel.split("/"):
+            cand = os.path.join(self.mroot, *rel.split("/"))
+            if os.path.isfile(cand) and _within(self.mroot, cand):
+                return cand, "found"
+        safe_base = os.path.basename(base or "")    # never let base carry a path component
+        if not safe_base:
+            return None, "missing"
+        if self._index is None:
+            self._build()
+        hits = [h for h in self._index.get(safe_base, []) if _within(self.mroot, h)]
+        if len(hits) == 1:
+            return hits[0], "found by name"
+        return None, ("ambiguous name" if hits else "missing")
+
+
 def _find_media_file(mroot, rel, base):
-    """Locate a media file for an attachment. The stored `rel` (message_media.file_path) is UNTRUSTED
-    DB content: reject absolute paths and any '..' traversal, and require the resolved file to stay
-    inside the media root. Fallback search is confined to the Media subtree by basename only."""
-    rel = (rel or "").replace("\\", "/")
-    if rel and not rel.startswith("/") and ".." not in rel.split("/"):
-        cand = os.path.join(mroot, *rel.split("/"))
-        if os.path.isfile(cand) and _within(mroot, cand):
-            return cand
-    safe_base = os.path.basename(base or "")        # never let base carry a path component
-    if not safe_base:
-        return None
-    mediadir = os.path.join(mroot, "Media")
-    searchdir = mediadir if os.path.isdir(mediadir) else mroot
-    for root, _dirs, files in os.walk(searchdir):
-        if safe_base in files:
-            hit = os.path.join(root, safe_base)
-            if _within(mroot, hit):
-                return hit
-    return None
+    """The file for an attachment, or None (missing / ambiguous). See _MediaLocator."""
+    return _MediaLocator(mroot).locate(rel, base)[0]
 
 
 if __name__ == "__main__":
