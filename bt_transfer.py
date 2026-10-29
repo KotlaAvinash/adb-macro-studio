@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 
@@ -123,6 +124,79 @@ def zip_media_info(path) -> dict:
         "label": "with media" if media else "without media",
         "media_bytes": sum(i.file_size for i in media),
         "chat_txt": txt[0].filename if txt else None,
+    }
+
+
+# Limits checked from ZIP metadata BEFORE anything is decompressed (zip-bomb / runaway guard).
+EXPORT_MAX_MEMBERS = 100_000
+EXPORT_MAX_TOTAL_BYTES = 8 * 1024 ** 3          # 8 GiB uncompressed in total
+EXPORT_MAX_RATIO = 1000                         # per-member expansion ratio...
+EXPORT_RATIO_MIN_BYTES = 100 * 1024 ** 2        # ...enforced only for members over 100 MiB
+_TRANSCRIPT_PROBE_BYTES = 64 * 1024
+# a WhatsApp transcript line carries a numeric date (any locale's digit order / separator)
+_DATE_TOKEN = re.compile(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}")
+
+
+def _pick_transcript(z, infos):
+    """The chat transcript member: `_chat.txt` (iOS / this tool's backup exports) if present, else
+    the top-level .txt whose opening lines carry a message date. Other .txt files are attachments."""
+    top = [i for i in infos if "/" not in i.filename and i.filename.lower().endswith(".txt")]
+    named = [i for i in top if i.filename.lower() == "_chat.txt"]
+    for i in named + [i for i in top if i not in named]:
+        with z.open(i) as f:
+            head = f.read(_TRANSCRIPT_PROBE_BYTES).decode("utf-8", "replace")
+        if _DATE_TOKEN.search(head):
+            return i
+    return None
+
+
+def validate_export(path) -> dict:
+    """The ONE validator every receipt path uses (normal arrival, last-chance catch, late retry).
+
+    A WhatsApp export counts as valid only when: it is a readable ZIP; no member is encrypted;
+    member count and sizes are within limits (checked from metadata before decompressing); EVERY
+    member decompresses with a correct CRC (`testzip`); and it holds a readable chat transcript.
+    Only reading the ZIP index - the previous check - accepted archives with corrupt members and
+    archives with no transcript at all.
+
+    Returns the zip_media_info fields plus ok/reason. Validity does NOT prove the file belongs to
+    the requested chat; callers attribute it separately."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = [i for i in z.infolist() if not i.is_dir()]
+            if not infos:
+                return {"ok": False, "reason": "empty archive"}
+            if len(infos) > EXPORT_MAX_MEMBERS:
+                return {"ok": False, "reason": f"too many members ({len(infos)})"}
+            if any(i.flag_bits & 0x1 for i in infos):
+                return {"ok": False, "reason": "encrypted member"}
+            total = sum(i.file_size for i in infos)
+            if total > EXPORT_MAX_TOTAL_BYTES:
+                return {"ok": False, "reason": f"uncompressed size {total} over limit"}
+            for i in infos:
+                if (i.file_size > EXPORT_RATIO_MIN_BYTES
+                        and i.file_size > EXPORT_MAX_RATIO * max(i.compress_size, 1)):
+                    return {"ok": False, "reason": f"member {i.filename!r} expands suspiciously"}
+            bad = z.testzip()                     # reads every member, verifies its CRC
+            if bad is not None:
+                return {"ok": False, "reason": f"corrupt member {bad!r} (CRC mismatch)"}
+            transcript = _pick_transcript(z, infos)
+            if transcript is None:
+                return {"ok": False, "reason": "no readable chat transcript"}
+    except Exception as e:                        # truncated / not a zip / damaged headers
+        return {"ok": False, "reason": f"not a readable zip ({e})"}
+    media = [i for i in infos if i is not transcript]
+    return {
+        "ok": True,
+        "reason": "",
+        "files": len(infos),
+        "txt": 1,
+        "media": len(media),
+        "has_media": bool(media),
+        "label": "with media" if media else "without media",
+        "media_bytes": sum(i.file_size for i in media),
+        "chat_txt": transcript.filename,
     }
 
 

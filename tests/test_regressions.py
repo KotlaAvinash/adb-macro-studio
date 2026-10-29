@@ -26,9 +26,12 @@ CID = wb.CONTACT_ID
 
 
 # ----------------------------------------------------------------------------- helpers
+TRANSCRIPT = "[06/10/2026, 18:56:01] Alice: hello\n"   # a real export transcript has dated lines
+
+
 def mkzip(path, media=True, size=2000):
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("_chat.txt", "hello")
+        z.writestr("_chat.txt", TRANSCRIPT)
         if media:
             z.writestr("IMG-0001.jpg", b"\xff\xd8" + b"0" * size)
 
@@ -269,7 +272,9 @@ class TestQuickShareNoDuplicates(unittest.TestCase):
         def send(*a, **k):
             calls.append(1)
             return "fail-transfer", None, None, "with media"
-        st = self._retry(send, late=("late.zip", 10, "h"))
+        late = os.path.join(tempfile.mkdtemp(), "WhatsApp Chat with Alice.zip")
+        mkzip(late)
+        st = self._retry(send, late=(late, os.path.getsize(late), bt.sha256(late)))
         self.assertEqual(st[0], "ok")
         self.assertEqual(len(calls), 1)
 

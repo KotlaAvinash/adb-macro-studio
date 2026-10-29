@@ -194,7 +194,7 @@ class RunTest(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def fake_export(self, adb, case, size, reopen, emit_log, stop, on_runner, pc, save, ensure,
-                    pause=None):
+                    pause=None, chat_name=None):
         before = len(adb.opened)
         if not reopen() or len(adb.opened) == before:
             return "fail-notfound", None, None, ""

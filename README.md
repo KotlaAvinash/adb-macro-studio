@@ -364,12 +364,22 @@ on, which blocks export - skipped, not an error; turn it off on that chat and re
 per-chat budget), `fail-sent` (the phone's Quick Share showed **"Failed"** - the transfer dropped,
 usually Bluetooth/Wi-Fi), `fail-transfer` (the file never arrived within the timeout - PC not
 receiving, asleep, or wrong save folder), `fail-noshare`/`fail-pcpick` (couldn't find Quick Share
-or this PC in the picker), `fail-notfound` (chat row not found), `fail-device` (phone disconnected
-too long). The phone's Quick Share page is read live during the send, so a **"Failed"** is caught
-in seconds (fast retry) and a **"Sent"** is logged as progress.
+or this PC in the picker, or two devices share the PC's name), `fail-notfound` (chat row not
+found), `fail-device` (phone disconnected too long), `fail-persist` (a valid export arrived but
+could not be hash-logged/copied into the case folder - the received file is left untouched and is
+not re-sent), `fail-ambiguous` (more than one arrival could be this chat's export - none chosen;
+review by hand). The phone's Quick Share page is read live during the send for progress
+(**"Sending"**, **"Sent"**, **"Completed"**); a **"Failed"** on that page is only logged - the page
+lists every nearby device, so the received file decides.
+
+An `ok` means the arrival passed one shared check on every path: a WhatsApp export whose every ZIP
+member passes its CRC and that has a chat transcript, whose filename names the chat being exported,
+and that was hash-logged with a verified copy kept in the case folder (see
+[docs/RELIABILITY.md](docs/RELIABILITY.md) §3).
 
 > **Limitation:** chats are tracked by display name. Two chats with the **identical** name are
-> de-duplicated — only the first is exported. Rename one on the phone if you need both.
+> de-duplicated — only the first is exported. Export the other one on its own and note it; do not
+> rename chats on an evidence phone (that modifies the evidence).
 
 ### Viewing the exported chats — offline WhatsApp-Web-style viewer
 [`chat_viewer.py`](chat_viewer.py) turns a folder of export `.zip`s into **one self-contained,
