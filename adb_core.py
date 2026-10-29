@@ -807,7 +807,8 @@ class TouchRecorder:
         parser = GestureParser(dev["max_x"], dev["max_y"], self.width, self.height)
         # -tt gives getevent a pty: output is line-buffered and it dies when we disconnect.
         cmd = self.adb.cmd("shell", "-tt", "getevent", "-lt", dev["path"])
-        self.adb.log("adb " + " ".join(cmd[1:]))
+        # same redaction as Adb.run - this line used to write the raw `-s <serial>` to the log
+        self.adb.log("adb " + self.adb._scrub(" ".join(_redact_cmd(cmd[1:]))))
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      stdin=subprocess.PIPE, creationflags=NO_WINDOW)
         threading.Thread(target=self._read, args=(parser,), daemon=True).start()
