@@ -171,49 +171,98 @@ def _save_raw(path, text):
         pass
 
 
+def query_status(raw):
+    """What a `content query` actually returned:
+      'ok'           - it returned rows;
+      'empty'        - it ran and returned no rows ("No result found.");
+      'error'        - it failed (adb error, permission denial, provider exception);
+      'unrecognized' - no output we can interpret (not counted as a successful empty result).
+    Zero contacts from a working query is NOT the same as a permission denial."""
+    t = (raw or "").strip()
+    if (t.startswith("__error__") or "Permission Denial" in t or "SecurityException" in t
+            or "Exception" in t or t.lower().startswith("error")):
+        return "error"
+    if "Row:" in t:
+        return "ok"
+    if "No result found" in t:
+        return "empty"
+    return "unrecognized"
+
+
 def extract_contacts(adb, out_dir, log=lambda m: None, case=None):
-    """Pull phone contacts + WhatsApp contacts (with JID) to CSVs in out_dir. Best-effort and
-    non-fatal. Returns {"contacts": n, "whatsapp": m, "files": [...]}"""
-    out_dir = str(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-    result = {"contacts": 0, "whatsapp": 0, "files": []}
+    """Pull phone contacts + WhatsApp contacts (with JID) into a NEW folder
+    '<out_dir>/contacts_<time>_<id>' - an earlier collection is never overwritten, even when this
+    one fails. Raw query output is always kept (it is the evidence of what the phone returned) and
+    hash-logged alongside the CSVs. A CSV is written only for a query that ran: a failed query
+    yields no CSV and an explicit 'error' status, never a misleading '0 contacts'.
+
+    Returns {"contacts": n, "whatsapp": m, "files": [...], "dir": folder,
+             "status": {query: ok|empty|error|unrecognized}, "ok": bool}"""
+    import bt_transfer as bt
+    acq = bt.new_acquisition_dir(str(out_dir), "contacts")
+    result = {"contacts": 0, "whatsapp": 0, "files": [], "dir": acq, "status": {}, "ok": False}
+
+    def _raw(name, text):
+        p = os.path.join(acq, name)
+        _save_raw(p, text)
+        if os.path.isfile(p):
+            result["files"].append(p)
+        return p
 
     try:
         log("extracting phone contacts...")
         phones, praw = pull_phone_contacts(adb)
-        _save_raw(os.path.join(out_dir, "contacts.raw.txt"), praw)
-        p_csv = os.path.join(out_dir, "contacts.csv")
-        _write_csv(p_csv, ["#", "name", "number", "normalized_number"],
-                   [[i, c["name"], c["number"], c["normalized"]] for i, c in enumerate(phones, 1)])
-        result["contacts"] = len(phones)
-        result["files"].append(p_csv)
-        log(f"phone contacts: {len(phones)} -> {os.path.basename(p_csv)}")
+        raw_name = os.path.basename(_raw("contacts.raw.txt", praw))
+        st = result["status"]["phone_contacts"] = query_status(praw)
+        if st in ("ok", "empty"):
+            p_csv = os.path.join(acq, "contacts.csv")
+            _write_csv(p_csv, ["#", "name", "number", "normalized_number"],
+                       [[i, c["name"], c["number"], c["normalized"]] for i, c in enumerate(phones, 1)])
+            result["contacts"] = len(phones)
+            result["files"].append(p_csv)
+            log(f"phone contacts: {len(phones)} -> {os.path.basename(p_csv)}")
+        else:
+            log(f"phone contacts: QUERY {st.upper()} - no CSV written (see {raw_name}); "
+                "earlier collections are untouched")
     except Exception as e:
+        result["status"]["phone_contacts"] = "error"
         log(f"phone-contacts extraction failed: {e!r}")
 
     try:
         log("extracting WhatsApp contacts (with JID)...")
         wa, (draw, rraw) = pull_whatsapp_contacts(adb)
-        _save_raw(os.path.join(out_dir, "whatsapp_contacts.data.raw.txt"), draw)
-        _save_raw(os.path.join(out_dir, "whatsapp_contacts.raw_contacts.raw.txt"), rraw)
-        w_csv = os.path.join(out_dir, "whatsapp_contacts.csv")
-        _write_csv(w_csv, ["#", "name", "number", "jid", "jid_source"],
-                   [[i, c["name"], c["number"], c["jid"], c["jid_source"]] for i, c in enumerate(wa, 1)])
-        result["whatsapp"] = len(wa)
-        result["files"].append(w_csv)
-        n_auth = sum(1 for c in wa if c["jid_source"] == "sync")
-        log(f"WhatsApp contacts: {len(wa)} ({n_auth} JIDs from sync, {len(wa) - n_auth} derived) "
-            f"-> {os.path.basename(w_csv)}")
+        _raw("whatsapp_contacts.data.raw.txt", draw)
+        _raw("whatsapp_contacts.raw_contacts.raw.txt", rraw)
+        s1 = result["status"]["whatsapp_data"] = query_status(draw)
+        s2 = result["status"]["whatsapp_raw_contacts"] = query_status(rraw)
+        if s1 in ("ok", "empty") and s2 in ("ok", "empty"):
+            w_csv = os.path.join(acq, "whatsapp_contacts.csv")
+            _write_csv(w_csv, ["#", "name", "number", "jid", "jid_source"],
+                       [[i, c["name"], c["number"], c["jid"], c["jid_source"]]
+                        for i, c in enumerate(wa, 1)])
+            result["whatsapp"] = len(wa)
+            result["files"].append(w_csv)
+            n_auth = sum(1 for c in wa if c["jid_source"] == "sync")
+            log(f"WhatsApp contacts: {len(wa)} ({n_auth} JIDs from sync, {len(wa) - n_auth} "
+                f"derived) -> {os.path.basename(w_csv)}")
+        else:
+            log(f"WhatsApp contacts: QUERY FAILED (data={s1}, raw_contacts={s2}) - no CSV "
+                "written; earlier collections are untouched")
     except Exception as e:
+        result["status"].setdefault("whatsapp_data", "error")
+        result["status"].setdefault("whatsapp_raw_contacts", "error")
         log(f"whatsapp-contacts extraction failed: {e!r}")
 
+    result["ok"] = bool(result["status"]) and all(
+        s in ("ok", "empty") for s in result["status"].values())
     if case is not None:
+        from pathlib import Path
         for fp in result["files"]:
             try:
-                from pathlib import Path
                 case.record_file(Path(fp), "contacts extraction (adb content query)")
-            except Exception:
-                pass
+            except Exception as e:
+                result["ok"] = False
+                log(f"WARNING: could not hash-log {os.path.basename(fp)} ({e})")
     return result
 
 

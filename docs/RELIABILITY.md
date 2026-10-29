@@ -188,6 +188,28 @@ faster than Quick Share, has no duplicates, and includes chats too large for Wha
 media. (An earlier "save on the phone then pull" idea was removed: it would have written a copy of
 every export onto the evidence device — unacceptable for a seized phone.)
 
+**Earlier results are never overwritten or deleted.** Each pull (`backup_<time>_<id>`, `media_…`) and
+each contacts collection (`contacts_<time>_<id>`) goes into its own new folder. Decryption writes into
+a private temporary folder; if it fails, times out or produces something that is not a WhatsApp
+database, only that temporary folder is removed. A result is published under a free name
+(`msgstore.db`, else `msgstore (1).db`, ...), so an existing decrypted database is never touched.
+A contacts query that fails keeps its raw output but writes **no** CSV and reports `error` — distinct
+from a query that ran and found none (`empty`). Raw query files are hash-logged with the CSVs.
+
+**Attachments keep their own identity.** Each distinct source file gets its own name inside the chat
+zip (two different `IMG-1.jpg`s become `IMG-1.jpg` and `IMG-1~<hash>.jpg`), so neither photo is lost
+or swapped. `backup_attachments.csv` records, per message, the source path, the name in the zip and
+whether it was copied (with SHA-256), `missing`, `ambiguous name` (several files share the name and
+the exact path is gone — never guessed), or a copy error. `backup_chats.csv` counts references,
+distinct files, copied, missing and errors separately.
+
+**Viewer rebuilds never show stale media.** In folder mode each archive's media lives under
+`media/<hash of the archive>/`; a file is reused only if its size and CRC match the archive member,
+otherwise it is re-extracted through a verified temporary file. Adding, removing or replacing zips
+cannot point one chat at another chat's media, and a page from an earlier build keeps showing what
+it showed. If an archive cannot be read, the others are still built and the run ends **INCOMPLETE**
+(exit code 2) with the failures listed.
+
 ## 9. Screen reading — what makes it robust
 
 Every decision the tool makes starts from a `uiautomator` screen dump. It is hardened against the

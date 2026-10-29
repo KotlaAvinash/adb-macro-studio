@@ -200,6 +200,21 @@ def validate_export(path) -> dict:
     }
 
 
+def new_acquisition_dir(parent, kind):
+    """Reserve a NEW, empty folder '<parent>/<kind>_<YYYYmmdd_HHMMSS>_<6 hex>' for one collection
+    attempt. os.mkdir is exclusive, so two attempts - even in the same second - never share a
+    folder, and an earlier acquisition is never written into, overwritten or cleaned up by a later
+    one (repeat, failure or timeout)."""
+    os.makedirs(parent, exist_ok=True)
+    while True:
+        d = os.path.join(parent, f"{kind}_{time.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}")
+        try:
+            os.mkdir(d)
+            return d
+        except FileExistsError:
+            continue
+
+
 def default_bt_folders():
     """Likely Windows locations for received Bluetooth files (best-effort guesses)."""
     home = Path(os.path.expanduser("~"))

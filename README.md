@@ -318,7 +318,9 @@ exported under another chat's name.
 
 ### Everything in one case folder
 Each session (each **Connect**) gets its own case folder, and everything for that session is saved
-there: `contacts.csv` and `whatsapp_contacts.csv` (names with their WhatsApp IDs), the scanned chat
+there: each contacts collection in its own `contacts_<time>_<id>/` folder (`contacts.csv`,
+`whatsapp_contacts.csv` with WhatsApp IDs, and the raw query output — a repeat never overwrites an
+earlier one, and a failed query is reported as an error, not "0 contacts"), the scanned chat
 list, **`exported_chats.csv`**, a **verified copy of every received export** under `exports/`, and
 `hashes.csv` + `session.log` (SHA-256 of every file). When a run continues an earlier session's
 progress, the earlier CSV is only **read** (its finished chats are skipped) and left untouched.
@@ -393,6 +395,9 @@ there, at any size, nothing skipped:
 python chat_viewer.py "E:\quickshare" --media folder
 # -> writes E:\quickshare\index.html  +  E:\quickshare\media\   (open index.html; keep media\ beside it)
 ```
+Rebuilding into the same place is safe: each archive's media sits in a folder named after the
+archive's content, so changed, added or removed zips never show another chat's (or an older) photo.
+If an archive is damaged, the others are still built and the command reports **INCOMPLETE**.
 
 Or a **single portable file** (good for one/a few smaller chats), media embedded as base64:
 ```bash

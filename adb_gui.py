@@ -1115,9 +1115,13 @@ class App:
             try:
                 self._adblog(f"contacts: extracting into the case folder {folder} ...")
                 res = ce.extract_contacts(adb, folder, log=self._adblog, case=case)
-                names = ", ".join(os.path.basename(f) for f in res["files"])
-                self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
-                             f"{res['whatsapp']} WhatsApp contacts -> {names or '(no files)'}")
+                where = os.path.basename(res["dir"])
+                if res["ok"]:
+                    self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
+                                 f"{res['whatsapp']} WhatsApp contacts -> {where}")
+                else:
+                    self._adblog(f"contacts: INCOMPLETE - query results {res['status']} -> {where}"
+                                 " (earlier collections are untouched)")
             except Exception as e:
                 self._adblog(f"contacts: extraction error: {e!r}")
 
@@ -1177,9 +1181,8 @@ class App:
                 contacts = None
                 if src == "device":
                     try:
-                        cdir = os.path.join(out, "_contacts")
-                        ce.extract_contacts(adb, cdir, log=self._adblog)
-                        contacts = _load_contacts_map(cdir)
+                        cres = ce.extract_contacts(adb, out, log=self._adblog)
+                        contacts = _load_contacts_map(cres["dir"])
                     except Exception as e:
                         self._adblog(f"backup: contacts step skipped ({e!r})")
                     crypt, _dg = wab.pull_backup(adb, out, emit=self._adblog, package=package)
@@ -1187,14 +1190,19 @@ class App:
                         return
                     if include_media:
                         media_root = wab.pull_media(adb, out, emit=self._adblog, package=package)
-                    db_path = os.path.join(out, "msgstore.db")
                     self._adblog("backup: pick the 64-char backup key file for THIS device...")
                     kpick = filedialog.askopenfilename(title="Backup key file (e.g. Wakey.txt)")
-                    if not kpick or not wab.decrypt_backup(crypt, kpick, db_path, emit=self._adblog):
+                    # decrypt beside the pulled backup; an existing db there is never overwritten -
+                    # use the path the decryptor actually published
+                    db_path = kpick and wab.decrypt_backup(
+                        crypt, kpick, os.path.join(os.path.dirname(crypt), "msgstore.db"),
+                        emit=self._adblog)
+                    if not db_path:
                         return
                 elif src.endswith((".crypt15", ".crypt14", ".crypt12")):
-                    db_path = os.path.join(out, "msgstore.db")
-                    if not wab.decrypt_backup(src, key, db_path, emit=self._adblog):
+                    db_path = wab.decrypt_backup(src, key, os.path.join(out, "msgstore.db"),
+                                                 emit=self._adblog)
+                    if not db_path:
                         return
                 else:
                     db_path = src                       # already a decrypted msgstore.db
@@ -1221,8 +1229,12 @@ class App:
                 # _adblog is the thread-safe logger (queues to the UI pump); never touch widgets here
                 self._adblog("contacts: starting extraction (phone contacts + WhatsApp JIDs)...")
                 res = ce.extract_contacts(adb, case.dir, log=self._adblog, case=case)
-                self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
-                             f"{res['whatsapp']} WhatsApp contacts. Saved in the case folder.")
+                where = os.path.basename(res["dir"])
+                if res["ok"]:
+                    self._adblog(f"contacts: done - {res['contacts']} phone contacts, "
+                                 f"{res['whatsapp']} WhatsApp contacts -> case folder {where}")
+                else:
+                    self._adblog(f"contacts: INCOMPLETE - query results {res['status']} -> {where}")
             except Exception as e:
                 self._adblog(f"contacts: extraction error (non-fatal): {e!r}")
 
