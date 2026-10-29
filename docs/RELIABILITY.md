@@ -67,9 +67,25 @@ never written to the CSV as `ok`.
 - On resume, the source CSV is backed up (`.bak`) before anything else.
 
 ### d. The export goes only to the intended PC
-The PC is matched by its **exact** name in the Quick Share picker. If the exact name can't be found,
-the tool fails that attempt rather than guessing — it never blind-taps a device position (the picker
-order changes as devices come and go).
+The PC is matched by its **exact** name in the Quick Share picker: a name with anything after it
+(`LAB phone`, `LAB(other)`) is treated as a different device, and if **two separate tiles** carry the
+exact name the attempt fails (`fail-pcpick`) instead of picking one. It never blind-taps a device
+position (the picker order changes as devices come and go).
+
+Limit: a display name is not authentication — any nearby device can advertise any name. The operator
+must confirm the receiving PC is the intended one.
+
+### d2. What an `ok` means
+An arrival counts only when it passes one shared check, used on every path (normal arrival,
+last-chance catch, late arrival before a retry):
+- it is a WhatsApp export: a readable ZIP whose **every member passes its CRC**, with no encrypted
+  members, within size limits read from the ZIP index before anything is decompressed, and with a
+  **chat transcript** (a `.txt` with dated message lines);
+- its filename **names the chat being exported** (WhatsApp names exports after the chat). A file
+  naming a different chat — e.g. the previous chat's export landing late — is ignored, never used.
+  Emoji-only chat names cannot be matched this way; for those, a single valid arrival is accepted.
+- the received file is **hash-logged** and a **hash-verified copy is kept** in the case folder. If
+  that fails, the chat is `fail-persist` (the received file is left untouched; nothing is re-sent).
 
 ### e. Same phone → same case file
 Resuming on the same device (matched by serial) continues the **same** evidence CSV; a different
@@ -104,7 +120,7 @@ file sizes are truthful, not guessed.
 
 | Status | Meaning | Retried? |
 |---|---|---|
-| `ok` | Complete, valid file received and hashed | — |
+| `ok` | Valid export of this chat received, hash-logged, and a verified copy kept in the case folder (§3 d2) | — |
 | `pending` | Discovered, not yet exported | — |
 | `running` | Currently exporting | — |
 | `skipped` | Deliberately not exported (before a chosen start point, not selected, or a confirmed duplicate) | no |
@@ -113,6 +129,8 @@ file sizes are truthful, not guessed.
 | `fail-export` | Couldn't drive the export menu | yes |
 | `fail-noshare` / `fail-pcpick` | Share sheet or PC not found in time | yes |
 | `fail-timeout` | Ran past the per-chat time budget | no |
+| `fail-persist` | A valid export arrived but could not be hash-logged / copied into the case folder; the received file is untouched — fix the disk/permission problem and resume | no (never re-sent) |
+| `fail-ambiguous` | More than one arrival could be this chat's export; none was chosen — review them by hand | no |
 
 Transient `fail-*` states are retried a few times; a chat that keeps failing is left in the CSV so it
 can be retried on the next run (resume).

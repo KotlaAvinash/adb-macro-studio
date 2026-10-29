@@ -836,12 +836,36 @@ def _wait_share_target(adb, timeout=30, stop=None):
     return None
 
 
+def _contains(outer, inner):
+    """True when node `inner`'s centre lies inside node `outer`'s bounds."""
+    x1, y1, x2, y2 = outer["bounds"]
+    cx, cy = core.node_center(inner)
+    return x1 <= cx < x2 and y1 <= cy < y2
+
+
+def _recipient_tiles(nodes, want):
+    """Distinct picker tiles whose name field is EXACTLY `want` (normalised, case-insensitive).
+    A tile often exposes its name twice (a TextView inside a labelled container); nested matches are
+    one tile, so they are merged. Returns one representative node per tile (the innermost)."""
+    hits = []
+    for n in nodes:
+        if any(f and _norm_name(f).lower() == want for f in (n.get("text"), n.get("desc"))):
+            hits.append(n)
+    tiles = []
+    for n in sorted(hits, key=core._area):                       # innermost first
+        if not any(_contains(n, t) or _contains(t, n) for t in tiles):
+            tiles.append(n)
+    return tiles
+
+
 def _wait_pc_node(adb, pc_name, timeout=30, stop=None):
-    """Find the Quick Share device-picker tile for EXACTLY `pc_name`. STRICT on purpose: it only
-    accepts a device whose name equals pc_name (optionally followed by a status like 'Available'),
-    so it can NEVER tap a different nearby device whose name merely contains pc_name as a substring
-    - critical because this selects the RECIPIENT. If two different device names would match, it
-    refuses (returns None) rather than guess."""
+    """Find the Quick Share picker tile for EXACTLY `pc_name` - this selects the RECIPIENT.
+
+    Exact match only: 'LAB phone' or 'LAB(other)' never match 'LAB' (a name followed by any suffix
+    is a different device; a status like 'Available' is not parsed out of the name field). Two
+    separate tiles with the same name are refused - fail closed rather than guess. An exact display
+    name is still not authentication: a device can advertise any name, so the operator must check
+    the receiver. Returns the tile node, or None (no unique match before timeout/stop)."""
     want = _norm_name(pc_name).lower()
     if not want:
         return None
@@ -849,17 +873,10 @@ def _wait_pc_node(adb, pc_name, timeout=30, stop=None):
     while time.time() < end:
         if stop is not None and stop.is_set():
             return None
-        hits, seen = [], set()
-        for n in _nodes(adb):
-            for f in (n.get("text"), n.get("desc")):
-                if not f:
-                    continue
-                fl = _norm_name(f).lower()
-                if fl == want or fl.startswith(want + " ") or fl.startswith(want + "("):
-                    hits.append(n); seen.add(fl); break
-        if len(seen) == 1 and hits:          # exactly ONE device name matched -> safe to tap it
-            return hits[0]
-        if len(seen) > 1:                    # ambiguous (multiple device names match) -> refuse
+        tiles = _recipient_tiles(_nodes(adb), want)
+        if len(tiles) == 1:
+            return tiles[0]
+        if len(tiles) > 1:                   # two different devices share the name -> refuse
             return None
         time.sleep(0.7)
     return None
@@ -1168,7 +1185,7 @@ def _pause_wait(pause, stop=None):
 
 def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
                     on_runner=None, pc_name=PC_NAME, save_dir=SAVE_DIR, auto_accept=True,
-                    deadline=None, pause=None):
+                    deadline=None, pause=None, chat_name=None):
     """Open chat is assumed already. Export (media -> fallback), send via Quick Share to
     `pc_name`, wait for the file on the PC, hash it, then navigate back to the chat list.
     `deadline` (epoch seconds) caps the time to reach the 'sent' point; if it's blown we give
@@ -1322,6 +1339,13 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         res = bt.wait_for_new_file(save_dir, before, timeout=30,
                                    abort=_abort, confirm=lambda: phone["completed"])
         if res:
+            arrived = Path(res[0]).name
+            if belongs_to_chat(arrived, chat_name) is False:
+                # e.g. the PREVIOUS chat's export landing late: never this chat's evidence
+                emit_log(f"ignored arrival {arrived!r}: names a different chat than {chat_name!r}")
+                before[arrived] = res[1]
+                res = None
+                continue
             break
         if phone["final_at"]:
             # the phone FINISHED the transfer (Sent/Completed) -> the file is imminent; wait a
@@ -1341,10 +1365,16 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
         # LAST-CHANCE catch: the file may have landed right at the wait boundary (or while we were
         # navigating). Grab a new, stable, VALID zip from the folder before declaring failure - so a
         # good transfer is validated and recorded instead of wrongly failed/duplicated.
-        late = _late_arrived_file(save_dir, before)
+        late = _late_arrived_file(save_dir, before, chat_name=chat_name)
+        if late == AMBIGUOUS:
+            emit_log("several exports could belong to this chat - recorded as fail-ambiguous")
+            if not (outer_stop is not None and outer_stop.is_set()):
+                _back_to_list(adb)
+            return "fail-ambiguous", None, None, media["mode"]
         if late:
             res = late
-    _back_to_list(adb)
+    if not (outer_stop is not None and outer_stop.is_set()):
+        _back_to_list(adb)                     # no input events after Stop
     if not res:
         # the file never arrived AND the transfer stopped showing progress: a real failure (PC not
         # receiving / asleep / wrong save folder / transfer dropped). Retried.
@@ -1360,29 +1390,58 @@ def export_and_send(adb, case, size, emit_log=lambda m: None, outer_stop=None,
     # UI-flow guess). A big attachment whose transfer was cut short lands as a TRUNCATED/corrupt zip;
     # recording that as 'ok' would be bad evidence, so a zip that won't open is treated as a failure
     # and retried. A valid zip also makes the CSV 'media' column truthful and explains file sizes.
-    label = media["mode"]
-    try:
-        info = bt.zip_media_info(path)
-    except Exception as e:
-        info = {"ok": False, "error": str(e)}
+    # Stop policy: a file that has ALREADY fully arrived is still validated and preserved (it is
+    # evidence); Stop only prevents further phone input, which is enforced above.
+    info = bt.validate_export(path)                     # CRCs + transcript, not just the index
     if not info.get("ok"):
-        emit_log(f"received file is not a valid/complete zip ({info.get('error')}) - treating as a "
-                 "failed transfer and retrying")
+        emit_log(f"received file is not a valid WhatsApp export ({info.get('reason')}) - treating "
+                 "as a failed transfer and retrying")
         return "fail-transfer", None, None, media["mode"]
     label = info["label"]                               # "with media"/"without media" from the zip itself
     emit_log(f"verified contents: {info['files']} files, {info['media']} media, "
              f"{info['media_bytes']/1e6:.1f} MB media ({label})")
     if label != media["mode"]:
         emit_log(f"note: UI flow attempted '{media['mode']}' but the file is '{label}'")
-    _record_export(case, path, digest, label, emit_log)
-    emit_log(f"received {Path(path).name} ({nbytes} bytes, {label})")
-    return "ok", path, digest, label
+    kept = _record_export(case, path, digest, label, emit_log)
+    if kept is None:
+        return "fail-persist", path, digest, label      # received, but evidence NOT retained
+    emit_log(f"received {Path(path).name} ({nbytes} bytes, {label}) -> kept as {Path(kept).name}")
+    return "ok", str(kept), digest, label
 
 
-def _late_arrived_file(save_dir, before, settle=2.0):
+AMBIGUOUS = "ambiguous"        # sentinel: several valid exports could be the requested chat's
+_DUP_SUFFIX = re.compile(r"\s*\(\d+\)$")
+
+
+def belongs_to_chat(filename, chat_name):
+    """Does a received export's filename name the requested chat?
+      True  - it names this chat (WhatsApp names exports '<localised prefix> <chat name>.zip';
+              some locales put the name first, so start or end of the name part both count);
+      False - it names something else (e.g. the PREVIOUS chat's export landing late);
+      None  - cannot tell: no chat name given, or a name with no letters/digits (emoji-only).
+    Compared on the punctuation/emoji-insensitive fingerprint, ignoring Windows' ' (1)' suffix."""
+    want = _fingerprint(chat_name) if chat_name else ""
+    if not want:
+        return None
+    stem = _DUP_SUFFIX.sub("", Path(filename).stem)
+    have = _fingerprint(stem)
+    return have.endswith(want) or have.startswith(want)
+
+
+def _acceptable(path, chat_name):
+    """Shared gate for every receipt path: (accept?, validation info, why-not)."""
+    info = bt.validate_export(path)
+    if not info.get("ok"):
+        return False, info, info.get("reason", "invalid export")
+    if belongs_to_chat(path, chat_name) is False:
+        return False, info, f"names a different chat than {chat_name!r}"
+    return True, info, ""
+
+
+def _late_arrived_file(save_dir, before, settle=2.0, chat_name=None):
     """A transfer the timeout cut off can still land a moment later. Return (path, bytes, sha256)
-    for a NEW, size-stable file that appeared since `before`, else None. This is the last guard
-    against a duplicate: if the file is already here, we must NOT re-send the chat."""
+    for the ONE new, size-stable, VALID export of `chat_name` that appeared since `before`;
+    AMBIGUOUS if several qualify; else None. Unrelated files never qualify."""
     if not save_dir:
         return None
     try:
@@ -1390,34 +1449,38 @@ def _late_arrived_file(save_dir, before, settle=2.0):
         cands = [n for n, s in now.items() if s > 0 and (n not in before or before.get(n) != s)]
         if not cands:
             return None
-        newest = max(cands, key=lambda n: os.path.getmtime(os.path.join(save_dir, n)))
-        p = os.path.join(save_dir, newest)
-        s1 = os.path.getsize(p)
+        sizes = {n: os.path.getsize(os.path.join(save_dir, n)) for n in cands}
         time.sleep(settle)
-        if os.path.getsize(p) != s1:                       # still growing -> not finished
+        stable = [n for n in cands if os.path.getsize(os.path.join(save_dir, n)) == sizes[n]]
+        good = [n for n in stable if _acceptable(os.path.join(save_dir, n), chat_name)[0]]
+        if len(good) > 1:
+            return AMBIGUOUS
+        if not good:
             return None
-        if p.lower().endswith(".zip") and not bt.zip_media_info(p).get("ok"):
-            return None                                    # partial/corrupt zip -> not a real success
-        return p, s1, bt.sha256(p)
+        p = os.path.join(save_dir, good[0])
+        return p, sizes[good[0]], bt.sha256(p)
     except OSError:
         return None
 
 
-def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
+def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200, chat_name=None):
     """The foolproof anti-duplicate guard. Before we ever RE-SEND a chat, make sure the previous
     transfer is not still completing: Quick Share writes the received file only when the transfer
     FINISHES, so a slow big-media transfer can be declared 'failed' and then land a moment later -
     re-sending it is what creates duplicate (1)(2)(3).zip files.
 
     We watch BOTH the save folder and the phone for up to `timeout`s:
-      - a NEW, size-stable, VALID zip -> accept it (the transfer succeeded; do NOT re-send);
+      - exactly one NEW, size-stable, VALID export naming `chat_name` -> accept it (do NOT re-send);
+      - several such exports -> AMBIGUOUS (never guessed into an 'ok');
+      - unrelated files (not a valid export, or naming another chat) are ignored, never accepted;
       - a file still GROWING, or the phone still showing Sending/%/progress -> keep waiting;
       - genuinely quiet (no file, no progress) for a while -> give up so a real failure is retried.
-    Returns (path, bytes, sha256) or None."""
+    Returns (path, bytes, sha256), AMBIGUOUS, or None."""
     if not save_dir:
         return None
     start = time.time()
     last_sizes = {}
+    rejected = {}               # name -> size already judged not ours (judge each version once)
     last_activity = time.time()
     next_phone = 0.0
     quiet_grace = 30.0
@@ -1430,6 +1493,7 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
         except Exception:
             now = {}
         growing = False
+        good = []
         for n, s in now.items():
             if s <= 0 or (n in before and before.get(n) == s):
                 continue                                   # unchanged pre-existing file
@@ -1438,12 +1502,27 @@ def _await_late_file(adb, save_dir, before, emit_log, outer_stop, timeout=200):
                 last_sizes[n] = s
                 last_activity = time.time()
                 continue
-            # stable since last poll -> is it a complete, valid export?
+            if rejected.get(n) == s:
+                continue
+            # stable since last poll -> a complete, valid export of THIS chat?
             p = os.path.join(save_dir, n)
             try:
-                if (not n.lower().endswith(".zip")) or bt.zip_media_info(p).get("ok"):
-                    time.sleep(0.6)
-                    return p, os.path.getsize(p), bt.sha256(p)
+                ok, _info, why = _acceptable(p, chat_name)
+            except OSError:
+                continue
+            if ok:
+                good.append(p)
+            else:
+                rejected[n] = s
+                emit_log(f"ignored arrival {n!r}: {why}")
+        if len(good) > 1:
+            emit_log("several exports could belong to this chat - not choosing one: "
+                     + ", ".join(Path(p).name for p in good))
+            return AMBIGUOUS
+        if good:
+            p = good[0]
+            try:
+                return p, os.path.getsize(p), bt.sha256(p)
             except OSError:
                 pass
         if time.time() >= next_phone:                      # read the phone's transfer screen
@@ -1491,28 +1570,44 @@ def keep_in_case(case, path, digest, note):
     if core.sha256_file(dest) != digest:
         dest.unlink()
         return None
-    case.record_file(dest, f"{note} (copy of {src})")
+    try:
+        case.record_file(dest, f"{note} (copy of {src})")
+    except Exception:
+        dest.unlink()                  # an unrecorded copy is not retained evidence - don't leave it
+        raise
     return dest
 
 
-def _record_export(case, path, digest, label, emit_log):
-    """Chain of custody for a received export: hash the received file where Quick Share saved it,
-    and keep a verified copy in the case folder."""
+def _record_export(case, path, digest, label, emit_log, attempts=3):
+    """Chain of custody for a received export: hash-log the received file where Quick Share saved
+    it, and keep a hash-verified copy in the case folder.
+
+    Returns the retained copy's path, or None when the evidence could NOT be retained (hash-log
+    failure, copy failure, or a copy whose SHA-256 differs). A failure is retried LOCALLY only - the
+    chat is never re-exported on the phone for it - and the received file is never touched. The
+    caller must not report 'ok' on None: 'ok' means a verified retained copy and a hash record."""
     note = f"whatsapp export ({label}) via Quick Share"
-    try:
-        case.record_file(Path(path), note)
-    except Exception as e:
-        emit_log(f"WARNING: could not record {Path(path).name} in the case log ({e})")
-    try:
-        if keep_in_case(case, path, digest, note) is None:
-            emit_log(f"WARNING: the copy of {Path(path).name} in the case folder did not match its "
-                     "hash - not kept (the received file is unchanged)")
-    except Exception as e:
-        emit_log(f"WARNING: could not copy {Path(path).name} into the case folder ({e})")
+    recorded, why = False, ""
+    for i in range(attempts):
+        try:
+            if not recorded:
+                case.record_file(Path(path), note)
+                recorded = True
+            kept = keep_in_case(case, path, digest, note)
+            if kept is not None:
+                return kept
+            why = "the case copy did not match the received file's SHA-256"
+        except Exception as e:
+            why = str(e)
+        if i + 1 < attempts:
+            time.sleep(1.0)
+    emit_log(f"EVIDENCE NOT RETAINED for {Path(path).name}: {why}. The received file is left "
+             f"untouched at {path} (status fail-persist; not re-sent)")
+    return None
 
 
 def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
-                      pc_name, save_dir, ensure_list, pause=None):
+                      pc_name, save_dir, ensure_list, pause=None, chat_name=None):
     """Run export_and_send, retrying the whole thing on a transient Quick Share failure
     (fail-transfer/noshare/pcpick). `reopen()` re-opens the chat from the list and returns
     True, or False if the chat row can't be found. Returns (status, path, digest, media).
@@ -1536,7 +1631,7 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
         status, path, digest, media = export_and_send(
             adb, case, size, emit_log=emit_log, outer_stop=outer_stop, on_runner=on_runner,
             pc_name=pc_name, save_dir=save_dir, deadline=time.time() + MAX_SEND_SECONDS,
-            pause=pause)
+            pause=pause, chat_name=chat_name)
         if (status not in SHARE_RETRY_STATUSES
                 or (outer_stop is not None and outer_stop.is_set())
                 or attempt >= SHARE_RETRIES):
@@ -1544,19 +1639,23 @@ def export_with_retry(adb, case, size, reopen, emit_log, outer_stop, on_runner,
         # FOOLPROOF anti-duplicate: never re-send while the previous (possibly slow) transfer could
         # still be completing. Wait and watch the folder + phone; if a valid file lands, accept it.
         emit_log("verifying the previous transfer really failed before re-sending (anti-duplicate)...")
-        late = _await_late_file(adb, save_dir, base_before, emit_log, outer_stop)
+        late = _await_late_file(adb, save_dir, base_before, emit_log, outer_stop,
+                                chat_name=chat_name)
+        if late == AMBIGUOUS:
+            return "fail-ambiguous", None, None, media
         if late:
             lp, lb, ld = late
-            label = media or "with media"
-            try:
-                info = bt.zip_media_info(lp)
-                if info.get("ok"):
-                    label = info["label"]
-            except Exception:
-                pass
-            emit_log(f"received {Path(lp).name} ({lb} bytes, {label}) - arrived late; NOT re-sending (no duplicate)")
-            _record_export(case, lp, ld, label, emit_log)
-            return "ok", lp, ld, label
+            info = bt.validate_export(lp)              # same validator as the normal arrival path
+            if not info.get("ok"):                     # (changed since the guard looked at it)
+                emit_log(f"late arrival {Path(lp).name!r} is no longer a valid export - retrying")
+            else:
+                label = info["label"]
+                emit_log(f"received {Path(lp).name} ({lb} bytes, {label}) - arrived late; "
+                         "NOT re-sending (no duplicate)")
+                kept = _record_export(case, lp, ld, label, emit_log)
+                if kept is None:
+                    return "fail-persist", lp, ld, label
+                return "ok", str(kept), ld, label
         emit_log(f"{status} - retrying (attempt {attempt + 2}/{1 + SHARE_RETRIES})")
         ensure_list()
     return status, path, digest, media
@@ -1605,11 +1704,13 @@ def write_csv_atomic(path, rows, log=lambda m: None):
       never erases prior progress);
     - if the target is LOCKED (Windows refuses the replace while the CSV is open, e.g. in Excel),
       retries briefly, then saves the update to a side file 'exported_chats.unsaved-<stamp>.csv'.
-      The update used to be discarded here, losing that progress."""
+      The update used to be discarded here, losing that progress.
+    Returns True (written), "side" (saved to the side file), or False (NOT saved) so a caller can
+    never report a run as cleanly complete over a failed evidence write."""
     try:
         if not rows:
             if os.path.exists(path) and os.path.getsize(path) > 0:
-                return                       # don't truncate real data to nothing
+                return True                  # don't truncate real data to nothing
         d = os.path.dirname(os.path.abspath(path))
         if d:
             os.makedirs(d, exist_ok=True)
@@ -1624,7 +1725,7 @@ def write_csv_atomic(path, rows, log=lambda m: None):
             try:
                 os.replace(tmp, path)        # atomic on the same filesystem
                 _CSV_FALLBACK.pop(path, None)
-                return
+                return True
             except PermissionError:
                 if attempt + 1 < tries:
                     time.sleep(0.4 * (attempt + 1))
@@ -1639,13 +1740,15 @@ def write_csv_atomic(path, rows, log=lambda m: None):
                 f"progress saved to '{os.path.basename(side)}'. Close the CSV and it is updated "
                 "again on the next write.")
         _CSV_FALLBACK[path] = side
+        return "side"
     except Exception as e:
-        log(f"csv write failed: {e}")
+        log(f"CSV NOT SAVED: {e}")
         try:
             if os.path.exists(path + ".tmp"):
                 os.remove(path + ".tmp")
         except Exception:
             pass
+        return False
 
 
 def plan_csv(case_dir, cases_dir, serial, package=None, picked=None):
@@ -2127,7 +2230,8 @@ class RollingBatch(threading.Thread):
                 media = "not exported"       # chat never opened -> no media choice made
             rows.append([i, _csv_safe(nm), st, media, _csv_safe(fn), digest, self.times.get(nm, ""),
                          self.section_of.get(nm, "")])
-        write_csv_atomic(self.csv_path, rows, lambda m: self.emit("log", m))
+        if write_csv_atomic(self.csv_path, rows, lambda m: self.emit("log", m)) is False:
+            self.csv_failed = True           # surfaced in the finished summary - never a clean DONE
 
     def _export_one(self, name):
         def reopen():
@@ -2144,7 +2248,7 @@ class RollingBatch(threading.Thread):
             self.adb, self.case, self.size, reopen,
             lambda m: self.emit("log", f"   {m}"),
             self._stop, self._set_runner, self.pc_name, self.save_dir, self._ensure_list,
-            pause=self._pause)
+            pause=self._pause, chat_name=name)
         # record the media mode that was chosen even if the send later failed
         # (blank only if we never reached the with/without-media choice)
         self.files[name] = (Path(path).name if path else "", digest or "", media)
@@ -2253,4 +2357,5 @@ class RollingBatch(threading.Thread):
             pending_left = sum(1 for s in self.status.values() if s in ("pending", "running"))
             self.emit("finished", {"exported": exported, "total": len(self.order),
                                    "csv": self.csv_path, "stopped": self._stop.is_set(),
-                                   "last": self._last_running, "pending": pending_left})
+                                   "last": self._last_running, "pending": pending_left,
+                                   "csv_failed": getattr(self, "csv_failed", False)})

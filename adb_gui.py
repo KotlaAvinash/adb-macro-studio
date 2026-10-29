@@ -840,6 +840,11 @@ class BatchExportWindow(tk.Toplevel):
                                                    foreground="#c60")
                             self._log(f"STOPPED by user at '{where}'. {summ['exported']} exported, "
                                       f"{summ.get('pending', 0)} still pending. CSV: {summ['csv']}")
+                        elif summ.get("csv_failed"):
+                            self.status_lbl.config(text="⚠ FINISHED BUT THE CSV WAS NOT SAVED - see log",
+                                                   foreground="#c00")
+                            self._log(f"FINISHED, but writing the evidence CSV failed at least once: "
+                                      f"{summ['csv']} may be out of date. Check the log above.")
                         else:
                             self.status_lbl.config(text=f"✓ DONE - {summ['exported']}/{summ['total']} "
                                                    "exported", foreground="#0a7")
