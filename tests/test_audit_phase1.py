@@ -294,5 +294,22 @@ class TestA10TruthfulPersistence(unittest.TestCase):
         self.assertIs(wb.write_csv_atomic(bad_path, [[1, "A", "ok", "", "", "", ""]]), False)
 
 
+# ----------------------------------------------------------------------------- R04 serial in logs
+class TestR04SerialNeverLogged(unittest.TestCase):
+    def test_touch_recorder_logs_the_tag_not_the_raw_serial(self):
+        import adb_core as core
+        logged = []
+        adb = core.Adb("adb", "SERIAL123XYZ", log=logged.append)
+        adb.shell = lambda *a, **k: ""
+        rec = core.TouchRecorder(adb, 1080, 2400, lambda g: None, lambda m: None)
+        with mock.patch.object(core, "parse_getevent_caps", lambda caps: []),                 mock.patch.object(core, "pick_touch_device",
+                                  lambda devs: {"path": "/dev/input/event1", "max_x": 1, "max_y": 1}),                 mock.patch.object(core.subprocess, "Popen") as popen,                 mock.patch.object(core.threading, "Thread"):
+            popen.return_value.stdout = []
+            rec.start()
+        self.assertTrue(logged)
+        self.assertFalse(any("SERIAL123XYZ" in m for m in logged), logged)
+        self.assertTrue(any(core.device_tag("SERIAL123XYZ") in m for m in logged), logged)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
